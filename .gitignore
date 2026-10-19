@@ -1,0 +1,36 @@
+# ── Environment & secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# Circle credentials
+.circle/
+
+# ── Node / Bun ────────────────────────────────────────────────────────────────
+node_modules/
+.bun-cache/
+
+# ── Foundry build artefacts ───────────────────────────────────────────────────
+contracts/out/
+contracts/cache/
+
+# ── Arc Studio runtime logs ───────────────────────────────────────────────────
+traces.jsonl
+console.jsonl
+
+# ── Arc Studio internal ───────────────────────────────────────────────────────
+.agents/
+
+# ── forge-std — exclude internal tests, fixtures, CI, and maintainer docs ─────
+# The src/ library files are kept (required to compile and test ArcSplit).
+lib/forge-std/test/
+lib/forge-std/.github/
+lib/forge-std/CONTRIBUTING.md
+lib/forge-std/RELEASE_CHECKLIST.md
+lib/forge-std/scripts/
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
