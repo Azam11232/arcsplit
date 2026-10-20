@@ -5,10 +5,10 @@ import { TokenUSDC } from '@web3icons/react'
 import { AlertCircle, ArrowRight } from 'lucide-react'
 import { useUsdcBalance } from '@/hooks/useUsdcBalance'
 import {
-  ARC_TESTNET_CHAIN_ID,
+  ARC_MAINNET_CHAIN_ID,
   parseUsdc,
   formatUsdc,
-  ARCSPLIT_ADDRESS,
+  getArcNetwork,
 } from '@/utils/arcsplit'
 
 interface Props {
@@ -18,16 +18,21 @@ interface Props {
 export function AmountStep({ onNext }: Props) {
   const { address, chainId, isConnected } = useAccount()
   const { switchChain } = useSwitchChain()
+  const network = getArcNetwork(chainId)
   const { raw: balanceRaw, formatted: balanceFormatted, isLoading: balanceLoading } = useUsdcBalance()
 
   const [input, setInput] = useState('')
   const [error, setError] = useState('')
 
-  const isWrongChain = isConnected && chainId !== ARC_TESTNET_CHAIN_ID
-  const isDeployed = !!ARCSPLIT_ADDRESS
+  const isWrongChain = isConnected && !network
+  const isDeployed = !!network?.contractAddress
 
   const handleInput = useCallback((val: string) => {
     const clean = val.replace(/[^0-9.]/g, '')
+    if (/^\d*\.?\d*$/.test(clean) && clean.split('.')[1]?.length > 6) {
+      setError('USDC amounts support up to 6 decimal places.')
+      return
+    }
     if (clean === '' || /^\d*\.?\d{0,6}$/.test(clean)) {
       setInput(clean)
       setError('')
@@ -68,11 +73,11 @@ export function AmountStep({ onNext }: Props) {
     <div className="flex flex-col gap-5">
       {/* Balance hero */}
       <section
-        className="rounded-3xl p-5"
+        className="balance-card rounded-3xl p-5 sm:p-6"
         style={{
-          background: 'var(--surface-strong)',
-          backdropFilter: 'blur(20px)',
-          border: '1px solid var(--border)',
+          background: 'var(--balance-bg)',
+          border: '1px solid var(--balance-border)',
+          boxShadow: 'var(--balance-shadow)',
         }}
       >
         <div className="mb-3 flex items-center gap-2">
@@ -83,25 +88,25 @@ export function AmountStep({ onNext }: Props) {
         </div>
         {isConnected ? (
           <div className="flex items-baseline gap-1.5">
-            <span className="display text-4xl font-bold tabular-nums" style={{ color: 'var(--ink)' }}>
+            <span className="display max-w-full break-words text-4xl font-bold tabular-nums sm:text-5xl" style={{ color: 'var(--ink)' }}>
               {balanceLoading ? '—' : balanceFormatted}
             </span>
             <span className="text-lg font-medium" style={{ color: 'var(--subtle)' }}>USDC</span>
           </div>
         ) : (
           <div className="flex items-baseline gap-1.5">
-            <span className="display text-4xl font-bold" style={{ color: 'var(--subtle)' }}>—</span>
+            <span className="display text-4xl font-bold sm:text-5xl" style={{ color: 'var(--subtle)' }}>—</span>
             <span className="text-lg font-medium" style={{ color: 'var(--subtle)' }}>USDC</span>
           </div>
         )}
         <p className="mt-1.5 text-xs" style={{ color: 'var(--muted)' }}>
-          {isConnected ? 'Arc Testnet · ERC-20 balance' : 'Connect wallet to see balance'}
+          {isConnected ? `${network?.name ?? 'Arc'} · ERC-20 balance` : 'Connect wallet to see balance'}
         </p>
       </section>
 
       {/* Amount input */}
       <div
-        className="rounded-2xl p-4"
+        className={`amount-field rounded-2xl p-4 sm:p-5${error ? ' amount-field-error' : ''}`}
         style={{
           background: 'var(--surface-muted)',
           border: error ? '1.5px solid var(--danger)' : '1.5px solid var(--border)',
@@ -117,9 +122,11 @@ export function AmountStep({ onNext }: Props) {
             onChange={(e) => handleInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleContinue()}
             placeholder="0.00"
-            className="display min-w-0 flex-1 bg-transparent text-4xl font-bold tabular-nums outline-none placeholder:text-slate-300"
+            className="display min-w-0 flex-1 bg-transparent text-3xl font-bold tabular-nums outline-none sm:text-4xl"
             style={{ color: 'var(--ink)' }}
             aria-label="USDC amount to split"
+            aria-invalid={!!error}
+            aria-describedby={error ? 'amount-error' : undefined}
             disabled={!isConnected || isWrongChain}
           />
           <div className="flex flex-col items-end gap-1">
@@ -127,7 +134,7 @@ export function AmountStep({ onNext }: Props) {
             {isConnected && balanceRaw > 0n && (
               <button
                 onClick={handleMax}
-                className="text-xs font-semibold"
+                className="surface-hover min-h-9 rounded-lg px-2 text-xs font-semibold"
                 style={{ color: 'var(--accent-hover)' }}
               >
                 Max
@@ -135,19 +142,22 @@ export function AmountStep({ onNext }: Props) {
             )}
           </div>
         </div>
+        <p className="mt-2 text-xs" style={{ color: 'var(--subtle)' }}>
+          USDC supports up to 6 decimal places.
+        </p>
       </div>
 
       {/* Inline error */}
       {error && (
-        <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={{ background: 'rgba(186,43,76,0.07)', border: '1px solid rgba(186,43,76,0.18)' }}>
+        <div id="amount-error" role="alert" className="flex items-start gap-2 rounded-xl px-3 py-2.5" style={{ background: 'var(--danger-surface)', border: '1px solid var(--danger-border)' }}>
           <AlertCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--danger)' }} />
-          <span className="text-sm" style={{ color: 'var(--danger)' }}>{error}</span>
+          <span className="min-w-0 text-sm leading-relaxed" style={{ color: 'var(--danger)' }}>{error}</span>
         </div>
       )}
 
       {/* Contract not deployed banner */}
       {!isDeployed && (
-        <div className="flex items-start gap-2 rounded-xl px-3 py-2.5" style={{ background: 'rgba(18,45,69,0.06)', border: '1px solid var(--border)' }}>
+        <div className="flex items-start gap-2 rounded-xl px-3 py-2.5" style={{ background: 'var(--info-surface)', border: '1px solid var(--border)' }}>
           <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" style={{ color: 'var(--muted)' }} />
           <p className="text-xs" style={{ color: 'var(--muted)' }}>
             ArcSplit contract not deployed yet. Set <code className="mono text-xs">VITE_ARCSPLIT_ADDRESS</code> in your <code className="mono text-xs">.env</code> after deploying.
@@ -161,8 +171,8 @@ export function AmountStep({ onNext }: Props) {
           {({ show }) => (
             <button
               onClick={show}
-              className="w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99]"
-              style={{ background: 'var(--accent)' }}
+              className="min-h-12 w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110"
+              style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.2)' }}
             >
               Connect Wallet
             </button>
@@ -170,25 +180,25 @@ export function AmountStep({ onNext }: Props) {
         </ConnectKitButton.Custom>
       ) : isWrongChain ? (
         <button
-          onClick={() => switchChain({ chainId: ARC_TESTNET_CHAIN_ID })}
-          className="w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99]"
-          style={{ background: 'var(--accent)' }}
+          onClick={() => switchChain({ chainId: ARC_MAINNET_CHAIN_ID })}
+          className="min-h-12 w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110"
+          style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.2)' }}
         >
-          Switch to Arc Testnet
+          Switch to Arc Mainnet
         </button>
       ) : (
         <button
           onClick={handleContinue}
           disabled={!input || !isDeployed}
-          className="flex w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
-          style={{ background: 'var(--accent)' }}
+          className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+          style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.2)' }}
         >
           Continue <ArrowRight className="h-4 w-4" />
         </button>
       )}
 
       <p className="text-center text-xs" style={{ color: 'var(--subtle)' }}>
-        Non-custodial · Arc Testnet · No fees
+        Non-custodial · {network?.name ?? 'Arc Mainnet'} · No fees
       </p>
     </div>
   )

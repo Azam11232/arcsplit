@@ -95,7 +95,9 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
         newErrors[r.id] = 'Enter a wallet address.'
         ok = false
       } else if (!isValidAddress(r.address)) {
-        newErrors[r.id] = 'Invalid Ethereum address.'
+        newErrors[r.id] = r.address.toLowerCase() === '0x0000000000000000000000000000000000000000'
+          ? 'The zero address cannot receive USDC.'
+          : 'Invalid Ethereum address.'
         ok = false
       } else if (seen.has(r.address.toLowerCase())) {
         newErrors[r.id] = 'Duplicate address.'
@@ -160,7 +162,7 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
           return (
             <div
               key={r.id}
-              className="rounded-2xl p-4"
+              className="recipient-card rounded-2xl p-4 sm:p-5"
               style={{
                 background: 'var(--surface-strong)',
                 border: rowError ? '1.5px solid var(--danger)' : '1.5px solid var(--border)',
@@ -174,7 +176,7 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
                 {recipients.length > 1 && (
                   <button
                     onClick={() => removeRecipient(r.id)}
-                    className="rounded-lg p-1 transition-all hover:opacity-70"
+                    className="flex h-10 w-10 items-center justify-center rounded-xl transition-all hover:bg-rose-400/10 hover:opacity-100"
                     style={{ color: 'var(--danger)' }}
                     aria-label={`Remove recipient ${idx + 1}`}
                   >
@@ -189,7 +191,7 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
                 value={r.address}
                 onChange={(e) => updateAddress(r.id, e.target.value.trim())}
                 placeholder="0x…"
-                className="mono w-full rounded-xl bg-transparent px-3 py-2.5 text-sm outline-none placeholder:text-slate-300"
+                className="mono w-full min-w-0 rounded-xl bg-transparent px-3 py-3 text-sm outline-none sm:text-base"
                 style={{
                   color: 'var(--ink)',
                   background: 'var(--surface-muted)',
@@ -199,8 +201,8 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
               />
 
               {/* Share + payout */}
-              <div className="mt-3 flex items-center gap-3">
-                <div className="flex flex-1 items-center gap-2">
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-1 items-center gap-2">
                   <input
                     type="number"
                     min={1}
@@ -208,7 +210,7 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
                     value={r.sharesBps === 0 ? '' : r.sharesBps}
                     onChange={(e) => updateShares(r.id, e.target.value)}
                     placeholder="bps"
-                    className="w-20 rounded-xl px-3 py-2 text-sm font-semibold tabular-nums outline-none"
+                    className="w-24 max-w-[40%] rounded-xl px-3 py-2.5 text-sm font-semibold tabular-nums outline-none"
                     style={{
                       color: 'var(--ink)',
                       background: 'var(--surface-muted)',
@@ -216,17 +218,17 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
                     }}
                     aria-label={`Recipient ${idx + 1} basis points`}
                   />
-                  <span className="text-sm font-medium tabular-nums" style={{ color: 'var(--muted)' }}>
+                  <span className="whitespace-nowrap text-sm font-medium tabular-nums" style={{ color: 'var(--muted)' }}>
                     = {(r.sharesBps / 100).toFixed(2)}%
                   </span>
                 </div>
-                <span className="text-sm font-semibold tabular-nums" style={{ color: 'var(--ink)' }}>
+                <span className="ml-auto whitespace-nowrap text-sm font-semibold tabular-nums" style={{ color: 'var(--ink)' }}>
                   {formatUsdc(payout)} USDC
                 </span>
               </div>
 
               {rowError && (
-                <p className="mt-2 text-xs" style={{ color: 'var(--danger)' }}>
+                <p role="alert" className="mt-2 rounded-lg px-2.5 py-2 text-xs leading-relaxed" style={{ color: 'var(--danger)', background: 'var(--danger-surface)' }}>
                   {rowError}
                 </p>
               )}
@@ -239,7 +241,7 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
       {recipients.length < 50 && (
         <button
           onClick={addRecipient}
-          className="flex w-full items-center justify-center gap-2 rounded-2xl py-3 text-sm font-semibold transition-all hover:opacity-80"
+          className="surface-hover flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3 text-sm font-semibold transition-all hover:border-[var(--border-strong)]"
           style={{
             background: 'var(--surface-muted)',
             border: '1.5px dashed var(--border)',
@@ -263,8 +265,8 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
         <div
           className="flex items-center justify-between rounded-xl px-4 py-2.5"
           style={{
-            background: total === 10000 ? 'rgba(26,128,71,0.08)' : 'rgba(186,43,76,0.06)',
-            border: `1px solid ${total === 10000 ? 'rgba(26,128,71,0.2)' : 'rgba(186,43,76,0.15)'}`,
+            background: total === 10000 ? 'var(--success-surface)' : 'var(--danger-surface)',
+            border: `1px solid ${total === 10000 ? 'var(--success-border)' : 'var(--danger-border)'}`,
           }}
         >
           <span className="text-xs font-medium" style={{ color: total === 10000 ? 'var(--success)' : 'var(--danger)' }}>
@@ -281,9 +283,9 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
 
       {/* Global error */}
       {globalError && (
-        <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={{ background: 'rgba(186,43,76,0.07)', border: '1px solid rgba(186,43,76,0.18)' }}>
+        <div role="alert" className="flex items-start gap-2 rounded-xl px-3 py-2.5" style={{ background: 'var(--danger-surface)', border: '1px solid var(--danger-border)' }}>
           <AlertCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--danger)' }} />
-          <span className="text-sm" style={{ color: 'var(--danger)' }}>{globalError}</span>
+          <span className="min-w-0 text-sm leading-relaxed" style={{ color: 'var(--danger)' }}>{globalError}</span>
         </div>
       )}
 
@@ -291,7 +293,7 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
       <div className="flex gap-3">
         <button
           onClick={onBack}
-          className="flex items-center gap-1.5 rounded-2xl px-5 py-3.5 text-sm font-semibold transition-all hover:opacity-80"
+          className="surface-hover flex min-h-12 items-center gap-1.5 rounded-2xl px-4 py-3.5 text-sm font-semibold transition-all sm:px-5"
           style={{ background: 'var(--surface-muted)', color: 'var(--ink-2)', border: '1px solid var(--border)' }}
         >
           <ArrowLeft className="h-4 w-4" /> Back
@@ -299,8 +301,8 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
         <button
           onClick={handleNext}
           disabled={recipients.length === 0}
-          className="flex flex-1 items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
-          style={{ background: 'var(--accent)' }}
+          className="flex min-h-12 flex-1 items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+          style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.18)' }}
         >
           Review Split <ArrowRight className="h-4 w-4" />
         </button>

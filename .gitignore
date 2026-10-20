@@ -34,3 +34,5 @@ lib/forge-std/scripts/
 Thumbs.db
 .vscode/
 .idea/
+# Vite build output
+dist/

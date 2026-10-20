@@ -1,6 +1,6 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useAccount, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi'
-import { erc20Abi } from 'viem'
+import { erc20Abi, WaitForTransactionReceiptTimeoutError } from 'viem'
 import { Loader2, ArrowLeft, ExternalLink, Check, AlertCircle, ArrowRight } from 'lucide-react'
 import { TokenUSDC } from '@web3icons/react'
 import { toast } from 'sonner'
@@ -11,13 +11,13 @@ import {
   shortAddress,
   parseContractError,
   txUrl,
-  USDC_ADDRESS,
-  ARCSPLIT_ADDRESS,
   ARCSPLIT_ABI,
-  ARC_TESTNET_CHAIN_ID,
+  ARC_MAINNET_CHAIN_ID,
+  getArcNetwork,
 } from '@/utils/arcsplit'
 import { useUsdcAllowance } from '@/hooks/useUsdcAllowance'
 import { useUsdcBalance } from '@/hooks/useUsdcBalance'
+import { playSuccessSound } from '@/utils/successSound'
 
 interface Props {
   amountRaw: bigint
@@ -26,11 +26,21 @@ interface Props {
   onReset: () => void
 }
 
+const soundedDistributionHashes = new Set<`0x${string}`>()
+
 // Track which step has been initiated in this session
 type TxPhase = 'idle' | 'approving' | 'approved' | 'distributing'
 
+function receiptErrorMessage(error: Error | null, action: string): string {
+  if (error instanceof WaitForTransactionReceiptTimeoutError) {
+    return `Timed out waiting for the ${action} receipt. The transaction outcome is unknown; check the explorer or retry the status check.`
+  }
+  return `Could not retrieve the ${action} receipt. The transaction outcome is unknown; check the explorer or retry the status check.`
+}
+
 export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
   const { chainId } = useAccount()
+  const network = getArcNetwork(chainId)
   const { switchChain, isPending: isSwitching } = useSwitchChain()
   const { raw: allowance, refetch: refetchAllowance } = useUsdcAllowance()
   const { raw: balance, refetch: refetchBalance } = useUsdcBalance()
@@ -38,43 +48,81 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
   const [txPhase, setTxPhase] = useState<TxPhase>('idle')
   const [error, setError] = useState('')
   const [approveTxHash, setApproveTxHash] = useState<`0x${string}` | undefined>()
+  const [approveTxChainId, setApproveTxChainId] = useState<number | undefined>()
   const [distributeTxHash, setDistributeTxHash] = useState<`0x${string}` | undefined>()
+  const [distributeTxChainId, setDistributeTxChainId] = useState<number | undefined>()
 
-  const isWrongChain = chainId !== ARC_TESTNET_CHAIN_ID
+  const isWrongChain = !network
   const payouts = computePayouts(recipients, amountRaw)
-  const needsApproval = allowance < amountRaw
+  const needsApproval = !network || allowance < amountRaw
 
   // ── Approve ───────────────────────────────────────────────────────────────
   const { writeContract: writeApprove, isPending: approvePending } = useWriteContract()
-  const { isLoading: approveConfirming, isSuccess: approveSuccess } = useWaitForTransactionReceipt({
+  const {
+    data: approveReceipt,
+    error: approveReceiptError,
+    isError: approveReceiptFailed,
+    isFetching: approveReceiptFetching,
+    isLoading: approveConfirming,
+    refetch: refetchApproveReceipt,
+  } = useWaitForTransactionReceipt({
     hash: approveTxHash,
+    chainId: approveTxChainId,
   })
 
   // ── Distribute ────────────────────────────────────────────────────────────
   const { writeContract: writeDistribute, isPending: distributePending } = useWriteContract()
-  const { isLoading: distributeConfirming, isSuccess: distributeSuccess } = useWaitForTransactionReceipt({
+  const {
+    data: distributeReceipt,
+    error: distributeReceiptError,
+    isError: distributeReceiptFailed,
+    isFetching: distributeReceiptFetching,
+    isLoading: distributeConfirming,
+    refetch: refetchDistributeReceipt,
+  } = useWaitForTransactionReceipt({
     hash: distributeTxHash,
+    chainId: distributeTxChainId,
   })
 
   // Derive the overall phase from transaction receipts where possible
   // to avoid calling setState inside effects
-  const isDone = distributeSuccess && txPhase === 'distributing'
-  const isApproved = (approveSuccess && txPhase === 'approving') || txPhase === 'approved'
+  const isDone = distributeReceipt?.status === 'success' && txPhase === 'distributing'
+  const isApproved = (approveReceipt?.status === 'success' && txPhase === 'approving') || txPhase === 'approved'
+  const approvalReceiptUnknown = approveReceiptFailed && txPhase === 'approving'
+  const distributionReceiptUnknown = distributeReceiptFailed && txPhase === 'distributing'
+  const approvalReverted = approveReceipt?.status === 'reverted' && txPhase === 'approving'
+  const distributionReverted = distributeReceipt?.status === 'reverted' && txPhase === 'distributing'
+  const receiptError = approvalReceiptUnknown
+    ? receiptErrorMessage(approveReceiptError, 'approval')
+    : distributionReceiptUnknown
+      ? receiptErrorMessage(distributeReceiptError, 'distribution')
+      : approvalReverted
+        ? 'The approval transaction reverted. No approval was confirmed.'
+        : distributionReverted
+          ? 'The distribution transaction reverted. No payment was sent.'
+          : ''
 
   const handleApprove = useCallback(() => {
+    if (!network?.contractAddress) {
+      setError('ArcSplit contract is not configured for this network.')
+      return
+    }
     setError('')
     setTxPhase('approving')
+    setApproveTxHash(undefined)
+    setApproveTxChainId(network.chainId)
     writeApprove(
       {
-        address: USDC_ADDRESS,
+        address: network.usdcAddress,
         abi: erc20Abi,
         functionName: 'approve',
-        args: [ARCSPLIT_ADDRESS, amountRaw],
-        chainId: ARC_TESTNET_CHAIN_ID,
+        args: [network.contractAddress, amountRaw],
+        chainId: network.chainId,
       },
       {
         onSuccess: (hash) => {
           setApproveTxHash(hash)
+          setApproveTxChainId(network.chainId)
           toast.info('Approval submitted…')
         },
         onError: (err) => {
@@ -87,7 +135,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
         },
       }
     )
-  }, [writeApprove, amountRaw])
+  }, [writeApprove, amountRaw, network])
 
   // When the user sees the approval has confirmed and clicks Distribute,
   // we advance to 'approved' phase so the UI shows the distribute button
@@ -98,6 +146,10 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
   }, [refetchAllowance])
 
   const handleDistribute = useCallback(() => {
+    if (!network?.contractAddress) {
+      setError('ArcSplit contract is not configured for this network.')
+      return
+    }
     setError('')
     setTxPhase('distributing')
 
@@ -107,9 +159,11 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
       return
     }
 
+    setDistributeTxHash(undefined)
+    setDistributeTxChainId(network.chainId)
     writeDistribute(
       {
-        address: ARCSPLIT_ADDRESS,
+        address: network.contractAddress,
         abi: ARCSPLIT_ABI,
         functionName: 'distribute',
         args: [
@@ -117,11 +171,12 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
           recipients.map((r) => BigInt(r.sharesBps)),
           amountRaw,
         ],
-        chainId: ARC_TESTNET_CHAIN_ID,
+        chainId: network.chainId,
       },
       {
         onSuccess: (hash) => {
           setDistributeTxHash(hash)
+          setDistributeTxChainId(network.chainId)
           toast.info('Distribution submitted…')
         },
         onError: (err) => {
@@ -134,23 +189,35 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
         },
       }
     )
-  }, [writeDistribute, recipients, amountRaw, balance])
+  }, [writeDistribute, recipients, amountRaw, balance, network])
 
   const isLoading = approvePending || approveConfirming || distributePending || distributeConfirming
   const approveStepDone = !needsApproval || isApproved || txPhase === 'distributing'
+  const refreshedDistributionHash = useRef<`0x${string}` | undefined>()
+
+  useEffect(() => {
+    if (!isDone || !distributeTxHash || refreshedDistributionHash.current === distributeTxHash) return
+    refreshedDistributionHash.current = distributeTxHash
+    void refetchBalance()
+  }, [isDone, distributeTxHash, refetchBalance])
+
+  useEffect(() => {
+    if (!isDone || !distributeTxHash || soundedDistributionHashes.has(distributeTxHash)) return
+    soundedDistributionHashes.add(distributeTxHash)
+    playSuccessSound()
+  }, [isDone, distributeTxHash])
 
   // ── Done state ────────────────────────────────────────────────────────────
   if (isDone) {
-    void refetchBalance()
     return (
-      <div className="flex flex-col gap-5">
+      <div className="success-screen flex flex-col gap-5">
         <div
-          className="flex flex-col items-center gap-4 rounded-3xl p-8 text-center"
-          style={{ background: 'var(--surface-strong)', border: '1px solid var(--border)' }}
+          className="flex flex-col items-center gap-4 rounded-3xl p-6 text-center sm:p-8"
+          style={{ background: 'var(--success-card-bg)', border: '1px solid var(--success-border)', boxShadow: 'var(--success-card-shadow)' }}
         >
           <div
-            className="flex h-16 w-16 items-center justify-center rounded-full"
-            style={{ background: 'rgba(26,128,71,0.12)' }}
+            className="success-mark flex h-16 w-16 items-center justify-center rounded-full"
+            style={{ background: 'var(--success-surface)', border: '1px solid var(--success-border)' }}
           >
             <Check className="h-8 w-8" style={{ color: 'var(--success)' }} />
           </div>
@@ -167,10 +234,10 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
           </div>
           {distributeTxHash && (
             <a
-              href={txUrl(distributeTxHash)}
+              href={txUrl(distributeTxChainId ?? ARC_MAINNET_CHAIN_ID, distributeTxHash)}
               target="_blank"
               rel="noreferrer"
-              className="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold transition-all hover:opacity-80"
+              className="surface-hover inline-flex min-h-10 items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold transition-all"
               style={{ background: 'var(--surface-muted)', color: 'var(--ink-2)', border: '1px solid var(--border)' }}
             >
               View on ArcScan <ExternalLink className="h-3 w-3" />
@@ -188,7 +255,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
           </p>
           <div className="flex flex-col gap-2">
             {recipients.map((r, i) => (
-              <div key={r.id} className="flex items-center justify-between">
+              <div key={r.id} className="flex flex-wrap items-center justify-between gap-2">
                 <span className="mono text-xs" style={{ color: 'var(--ink-2)' }}>
                   {shortAddress(r.address)}
                 </span>
@@ -202,8 +269,8 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
 
         <button
           onClick={onReset}
-          className="w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99]"
-          style={{ background: 'var(--accent)' }}
+          className="min-h-12 w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110"
+          style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.2)' }}
         >
           Split Another Payment
         </button>
@@ -214,24 +281,29 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
   // ── Review state ──────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col gap-4">
-      <div>
-        <h2 className="display text-base font-semibold" style={{ color: 'var(--ink)' }}>
-          Review &amp; Send
-        </h2>
-        <p className="text-xs" style={{ color: 'var(--muted)' }}>
-          Two steps: Approve USDC, then Distribute
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="display text-base font-semibold" style={{ color: 'var(--ink)' }}>
+            Review &amp; Send
+          </h2>
+          <p className="text-xs" style={{ color: 'var(--muted)' }}>
+            Two steps: Approve USDC, then Distribute
+          </p>
+        </div>
+        <span className="rounded-full px-3 py-1.5 text-[11px] font-semibold" style={{ color: 'var(--accent-hover)', background: 'var(--info-surface)', border: '1px solid var(--info-border)' }}>
+          {network?.name ?? 'Unsupported network'}
+        </span>
       </div>
 
       {/* Amount summary */}
       <div
-        className="flex items-center gap-3 rounded-2xl p-4"
-        style={{ background: 'var(--surface-strong)', border: '1px solid var(--border)' }}
+        className="flex min-w-0 items-center gap-3 rounded-2xl p-4 sm:p-5"
+        style={{ background: 'var(--summary-card-bg)', border: '1px solid var(--info-border)' }}
       >
         <TokenUSDC variant="branded" size={32} />
         <div>
           <p className="text-xs" style={{ color: 'var(--muted)' }}>Total to split</p>
-          <p className="display text-2xl font-bold tabular-nums" style={{ color: 'var(--ink)' }}>
+          <p className="display text-2xl font-bold tabular-nums sm:text-3xl" style={{ color: 'var(--ink)' }}>
             {formatUsdc(amountRaw)}{' '}
             <span className="text-base font-medium" style={{ color: 'var(--subtle)' }}>USDC</span>
           </p>
@@ -277,8 +349,8 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
         <div
           className="flex items-center gap-3 rounded-xl px-4 py-3"
           style={{
-            background: approveStepDone ? 'rgba(26,128,71,0.06)' : 'var(--surface-muted)',
-            border: '1px solid var(--border)',
+            background: approveStepDone ? 'var(--success-surface)' : 'var(--surface-muted)',
+            border: `1px solid ${approveStepDone ? 'var(--success-border)' : 'var(--border)'}`,
           }}
         >
           <div
@@ -304,7 +376,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
           )}
           {approveTxHash && (
             <a
-              href={txUrl(approveTxHash)}
+              href={txUrl(approveTxChainId ?? ARC_MAINNET_CHAIN_ID, approveTxHash)}
               target="_blank"
               rel="noreferrer"
               className="flex-shrink-0"
@@ -319,9 +391,9 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
         <div
           className="flex items-center gap-3 rounded-xl px-4 py-3"
           style={{
-            background: txPhase === 'distributing' ? 'rgba(18,45,69,0.06)' : 'var(--surface-muted)',
-            border: '1px solid var(--border)',
-            opacity: txPhase === 'idle' || txPhase === 'approving' ? 0.5 : 1,
+            background: txPhase === 'distributing' ? 'var(--info-surface)' : 'var(--surface-muted)',
+            border: `1px solid ${txPhase === 'distributing' ? 'var(--info-border)' : 'var(--border)'}`,
+            opacity: txPhase === 'idle' || txPhase === 'approving' ? 0.72 : 1,
           }}
         >
           <div
@@ -347,7 +419,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
           )}
           {distributeTxHash && (
             <a
-              href={txUrl(distributeTxHash)}
+              href={txUrl(distributeTxChainId ?? ARC_MAINNET_CHAIN_ID, distributeTxHash)}
               target="_blank"
               rel="noreferrer"
               className="flex-shrink-0"
@@ -360,39 +432,61 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
       </div>
 
       {/* Error */}
-      {error && (
+      {(error || receiptError) && (
         <div
-          className="flex items-center gap-2 rounded-xl px-3 py-2.5"
-          style={{ background: 'rgba(186,43,76,0.07)', border: '1px solid rgba(186,43,76,0.18)' }}
+          role="alert"
+          className="flex items-start gap-2 rounded-xl px-3 py-2.5"
+          style={{
+            background: approvalReceiptUnknown || distributionReceiptUnknown ? 'var(--warning-surface)' : 'var(--danger-surface)',
+            border: `1px solid ${approvalReceiptUnknown || distributionReceiptUnknown ? 'var(--warning-border)' : 'var(--danger-border)'}`,
+          }}
         >
-          <AlertCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--danger)' }} />
-          <span className="text-sm" style={{ color: 'var(--danger)' }}>{error}</span>
+          <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" style={{ color: approvalReceiptUnknown || distributionReceiptUnknown ? 'var(--warning)' : 'var(--danger)' }} />
+          <span className="min-w-0 text-sm leading-relaxed" style={{ color: approvalReceiptUnknown || distributionReceiptUnknown ? 'var(--warning)' : 'var(--danger)' }}>{error || receiptError}</span>
         </div>
       )}
 
       {/* Nav + CTAs */}
       <div className="flex flex-col gap-3">
-        {isWrongChain ? (
+        {approvalReceiptUnknown ? (
           <button
-            onClick={() => switchChain({ chainId: ARC_TESTNET_CHAIN_ID })}
+            onClick={() => { setError(''); void refetchApproveReceipt() }}
+            disabled={approveReceiptFetching}
+            className="min-h-12 w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ background: 'var(--accent-gradient)' }}
+          >
+            {approveReceiptFetching ? 'Checking approval status…' : 'Retry approval status check'}
+          </button>
+        ) : distributionReceiptUnknown ? (
+          <button
+            onClick={() => { setError(''); void refetchDistributeReceipt() }}
+            disabled={distributeReceiptFetching}
+            className="min-h-12 w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ background: 'var(--accent-gradient)' }}
+          >
+            {distributeReceiptFetching ? 'Checking distribution status…' : 'Retry distribution status check'}
+          </button>
+        ) : isWrongChain ? (
+          <button
+            onClick={() => switchChain({ chainId: ARC_MAINNET_CHAIN_ID })}
             disabled={isSwitching}
-            className="w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-40"
-            style={{ background: 'var(--accent)' }}
+            className="min-h-12 w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ background: 'var(--accent-gradient)' }}
           >
             {isSwitching ? (
               <span className="flex items-center justify-center gap-2">
                 <Loader2 className="h-4 w-4 animate-spin" /> Switching…
               </span>
             ) : (
-              'Switch to Arc Testnet'
+              'Switch to Arc Mainnet'
             )}
           </button>
         ) : txPhase === 'idle' || txPhase === 'approving' ? (
           /* Show the approval CTA, or "advance to distribute" if approval just confirmed */
-          approveSuccess && txPhase === 'approving' ? (
+          isApproved && txPhase === 'approving' ? (
             <button
               onClick={handleAdvanceToDistribute}
-              className="flex w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99]"
+              className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-slate-950 transition-all hover:brightness-110"
               style={{ background: 'var(--success)' }}
             >
               <Check className="h-4 w-4" /> Approved — Continue
@@ -401,8 +495,8 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
             <button
               onClick={handleApprove}
               disabled={isLoading || (!needsApproval && txPhase === 'idle')}
-              className="flex w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ background: 'var(--accent)' }}
+              className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ background: 'var(--accent-gradient)' }}
             >
               {approvePending ? (
                 <>
@@ -411,6 +505,10 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
               ) : approveConfirming ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" /> Confirming…
+                </>
+              ) : approvalReverted ? (
+                <>
+                  Retry Approval <ArrowRight className="h-4 w-4" />
                 </>
               ) : !needsApproval ? (
                 <>
@@ -427,8 +525,8 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
           <button
             onClick={handleDistribute}
             disabled={isLoading}
-            className="flex w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.01] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
-            style={{ background: 'var(--accent)' }}
+            className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ background: 'var(--accent-gradient)' }}
           >
             {distributePending ? (
               <>
@@ -440,7 +538,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
               </>
             ) : (
               <>
-                Distribute Now <ArrowRight className="h-4 w-4" />
+                {distributionReverted ? 'Retry Distribution' : 'Distribute Now'} <ArrowRight className="h-4 w-4" />
               </>
             )}
           </button>
@@ -449,7 +547,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
         {txPhase === 'idle' && (
           <button
             onClick={onBack}
-            className="flex items-center justify-center gap-1.5 rounded-2xl py-3 text-sm font-semibold transition-all hover:opacity-80"
+            className="surface-hover flex min-h-12 items-center justify-center gap-1.5 rounded-2xl py-3 text-sm font-semibold transition-all"
             style={{ background: 'var(--surface-muted)', color: 'var(--ink-2)', border: '1px solid var(--border)' }}
           >
             <ArrowLeft className="h-4 w-4" /> Back

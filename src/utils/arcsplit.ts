@@ -1,33 +1,62 @@
 /**
  * ArcSplit contract config and utilities.
  *
- * The contract address below is set after deployment. Until deployed, it is
- * left as an empty string — the UI will show a "not deployed" banner.
- *
- * USDC address is read from @/onchain-facts (Arc Testnet: 0x3600...0000).
+ * Contract and USDC addresses are selected by chain. ERC-20 USDC amounts use
+ * the token's 6 decimals; Arc's native gas currency has 18 decimals.
  */
 
 import { getUsdc, requireChain } from '@/onchain-facts'
 
-// Arc Testnet chain ID
+export const ARC_MAINNET_CHAIN_ID = 5042
 export const ARC_TESTNET_CHAIN_ID = 5042002
 
-// Resolved from onchain-facts registry — do not hardcode
-const usdcFact = getUsdc(ARC_TESTNET_CHAIN_ID)
-if (!usdcFact) throw new Error('USDC not registered for Arc Testnet in onchain-facts')
-export const USDC_ADDRESS = usdcFact.address as `0x${string}`
-export const USDC_DECIMALS = usdcFact.decimals // 6
+const mainnetUsdc = getUsdc(ARC_MAINNET_CHAIN_ID)
+if (!mainnetUsdc) throw new Error('USDC not registered for Arc Mainnet in onchain-facts')
+const testnetUsdc = getUsdc(ARC_TESTNET_CHAIN_ID)
+if (!testnetUsdc) throw new Error('USDC not registered for Arc Testnet in onchain-facts')
 
-const chainFact = requireChain(ARC_TESTNET_CHAIN_ID)
-export const EXPLORER_BASE = chainFact.explorerBase
+export const USDC_ADDRESS = mainnetUsdc.address as `0x${string}`
+export const USDC_DECIMALS = mainnetUsdc.decimals
 
-/**
- * ArcSplit contract address — fill in after deployment.
- * Set VITE_ARCSPLIT_ADDRESS in .env to override.
- */
 export const ARCSPLIT_ADDRESS = (
   import.meta.env.VITE_ARCSPLIT_ADDRESS ?? ''
 ) as `0x${string}`
+const TESTNET_ARCSPLIT_ADDRESS = (
+  import.meta.env.VITE_ARCSPLIT_TESTNET_ADDRESS ??
+  '0xd90b75d07a2b592b0a01f0ac63d522f54ffd1ef2'
+) as `0x${string}`
+
+export interface ArcNetwork {
+  chainId: number
+  name: string
+  usdcAddress: `0x${string}`
+  usdcDecimals: number
+  contractAddress: `0x${string}`
+  explorerBase: string
+}
+
+const arcNetworks: Record<number, ArcNetwork> = {
+  [ARC_MAINNET_CHAIN_ID]: {
+    chainId: ARC_MAINNET_CHAIN_ID,
+    name: 'Arc Mainnet',
+    usdcAddress: mainnetUsdc.address as `0x${string}`,
+    usdcDecimals: mainnetUsdc.decimals,
+    contractAddress: ARCSPLIT_ADDRESS,
+    explorerBase: requireChain(ARC_MAINNET_CHAIN_ID).explorerBase,
+  },
+  [ARC_TESTNET_CHAIN_ID]: {
+    chainId: ARC_TESTNET_CHAIN_ID,
+    name: 'Arc Testnet',
+    usdcAddress: testnetUsdc.address as `0x${string}`,
+    usdcDecimals: testnetUsdc.decimals,
+    contractAddress: TESTNET_ARCSPLIT_ADDRESS,
+    explorerBase: requireChain(ARC_TESTNET_CHAIN_ID).explorerBase,
+  },
+}
+
+export function getArcNetwork(chainId: number | undefined): ArcNetwork | undefined {
+  return chainId === undefined ? undefined : arcNetworks[chainId]
+}
 
 export const ARCSPLIT_ABI = [
   {
@@ -76,19 +105,29 @@ export const ARCSPLIT_ABI = [
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
-/** Parse a human-entered USDC string to smallest unit (BigInt, 6 decimals) */
+/** Parse a human-entered USDC string to smallest unit (BigInt, 6 decimals). */
 export function parseUsdc(value: string): bigint {
+  if (!/^\d*\.?\d+$|^\d+\.$/.test(value)) {
+    throw new Error('Enter a valid USDC amount.')
+  }
   const [intPart, fracPart = ''] = value.split('.')
-  const frac = fracPart.slice(0, USDC_DECIMALS).padEnd(USDC_DECIMALS, '0')
+  if (fracPart.length > USDC_DECIMALS) {
+    throw new Error(`USDC amounts support up to ${USDC_DECIMALS} decimal places.`)
+  }
+  const frac = fracPart.padEnd(USDC_DECIMALS, '0')
   return BigInt(intPart || '0') * BigInt(10 ** USDC_DECIMALS) + BigInt(frac)
 }
 
-/** Format a USDC raw bigint to a display string with 2 decimal places */
+/** Format a USDC raw bigint exactly, with at least 2 and at most 6 decimals. */
 export function formatUsdc(raw: bigint): string {
   const divisor = BigInt(10 ** USDC_DECIMALS)
   const whole = raw / divisor
   const frac = raw % divisor
-  const fracStr = frac.toString().padStart(USDC_DECIMALS, '0').slice(0, 2)
+  const fracStr = frac
+    .toString()
+    .padStart(USDC_DECIMALS, '0')
+    .replace(/0+$/, '')
+    .padEnd(2, '0')
   return `${whole}.${fracStr}`
 }
 
@@ -134,7 +173,8 @@ export interface Recipient {
 
 /** Validate an Ethereum address */
 export function isValidAddress(addr: string): boolean {
-  return /^0x[0-9a-fA-F]{40}$/.test(addr)
+  return /^0x[0-9a-fA-F]{40}$/.test(addr) &&
+    addr.toLowerCase() !== '0x0000000000000000000000000000000000000000'
 }
 
 /** Compute per-recipient payout amounts given totalRaw (6-decimal bigint) */
@@ -157,6 +197,8 @@ export function computePayouts(
 }
 
 /** Build a tx explorer URL */
-export function txUrl(hash: string): string {
-  return `${EXPLORER_BASE}/tx/${hash}`
+export function txUrl(chainId: number, hash: string): string {
+  const network = getArcNetwork(chainId)
+  if (!network) throw new Error(`Unsupported Arc chain ID: ${chainId}`)
+  return `${network.explorerBase}/tx/${hash}`
 }

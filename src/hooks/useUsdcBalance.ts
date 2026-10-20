@@ -1,26 +1,26 @@
 import { useAccount, useReadContract } from 'wagmi'
 import { erc20Abi } from 'viem'
-import { USDC_ADDRESS, USDC_DECIMALS, ARC_TESTNET_CHAIN_ID, formatUsdc } from '@/utils/arcsplit'
+import { ARC_MAINNET_CHAIN_ID, formatUsdc, getArcNetwork } from '@/utils/arcsplit'
 
 /**
- * Returns the connected wallet's USDC balance on Arc Testnet.
- * Reads from the ERC-20 contract (6-decimal view) — do NOT also use
- * useBalance for the native view on Arc, as they both represent the same pool.
+ * Reads the connected Arc chain's ERC-20 USDC balance in 6-decimal units.
+ * Do not use the native balance: Arc's gas-token view uses 18 decimals.
  */
 export function useUsdcBalance() {
-  const { address } = useAccount()
+  const { address, chainId } = useAccount()
+  const network = getArcNetwork(chainId)
 
   const { data: rawBalance, isLoading, refetch } = useReadContract({
-    address: USDC_ADDRESS,
+    address: network?.usdcAddress,
     abi: erc20Abi,
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
-    chainId: ARC_TESTNET_CHAIN_ID,
-    query: { enabled: !!address },
+    chainId: network?.chainId ?? ARC_MAINNET_CHAIN_ID,
+    query: { enabled: !!address && !!network },
   })
 
   const raw = (rawBalance) ?? 0n
-  const decimals = USDC_DECIMALS
+  const decimals = network?.usdcDecimals ?? 6
 
   return {
     raw,
