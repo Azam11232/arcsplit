@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
     address: string | undefined
   }>(() => ({ chainId: undefined, isConnected: false, address: undefined })),
   getArcNetwork: vi.fn(),
+  switchChain: vi.fn(),
   network: undefined as {
     chainId: number
     name: string
@@ -19,7 +20,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('wagmi', () => ({
   useAccount: mocks.account,
-  useSwitchChain: () => ({ switchChain: vi.fn() }),
+  useSwitchChain: () => ({ switchChain: mocks.switchChain }),
 }))
 
 vi.mock('connectkit', () => ({
@@ -39,6 +40,7 @@ vi.mock('@/hooks/useUsdcBalance', () => ({
 
 vi.mock('@/utils/arcsplit', () => ({
   ARC_MAINNET_CHAIN_ID: 5042,
+  ARC_TESTNET_CHAIN_ID: 5042002,
   formatUsdc: vi.fn(() => '0.00'),
   getArcNetwork: mocks.getArcNetwork,
   parseUsdc: vi.fn(() => 1_000_000n),
@@ -52,6 +54,7 @@ beforeEach(() => {
   mocks.account.mockReturnValue({ chainId: undefined, isConnected: false, address: undefined })
   mocks.network = undefined
   mocks.getArcNetwork.mockImplementation(() => mocks.network)
+  mocks.switchChain.mockReset()
 })
 
 afterEach(cleanup)
@@ -78,6 +81,34 @@ describe('AmountStep contract address notice', () => {
     renderAmountStep()
 
     expect(screen.queryByText('ArcSplit contract address is not configured for this network.')).toBeNull()
+  })
+
+  it('offers a user-triggered switch to Mainnet on Arc Testnet while preserving testing access', () => {
+    mocks.account.mockReturnValue({
+      chainId: 5042002,
+      isConnected: true,
+      address: '0x1111111111111111111111111111111111111111',
+    })
+    mocks.network = {
+      chainId: 5042002,
+      name: 'Arc Testnet',
+      contractAddress: '0xd90b75d07a2b592b0a01f0ac63d522f54ffd1ef2',
+    }
+
+    renderAmountStep()
+
+    expect(screen.getByText(/Arc Testnet is for testing/)).toBeTruthy()
+    expect(mocks.switchChain).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'USDC amount to split' }), {
+      target: { value: '1' },
+    })
+
+    expect(screen.getByRole('button', { name: /continue/i }).hasAttribute('disabled')).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to Arc Mainnet' }))
+
+    expect(mocks.switchChain).toHaveBeenCalledWith({ chainId: 5042 })
   })
 
   it('shows the notice and prevents continuing when the selected network has no contract address', () => {
@@ -109,6 +140,13 @@ describe('AmountStep contract address notice', () => {
     renderAmountStep()
 
     expect(screen.queryByText('ArcSplit contract address is not configured for this network.')).toBeNull()
-    expect(screen.getByRole('button', { name: 'Switch to Arc Mainnet' })).toBeTruthy()
+    expect(screen.getByText('This network is not supported by ArcSplit. Switch to Arc Mainnet to make a payment.')).toBeTruthy()
+    const switchButton = screen.getByRole('button', { name: 'Switch to Arc Mainnet' })
+    expect(switchButton).toBeTruthy()
+    expect(mocks.switchChain).not.toHaveBeenCalled()
+
+    fireEvent.click(switchButton)
+
+    expect(mocks.switchChain).toHaveBeenCalledWith({ chainId: 5042 })
   })
 })

@@ -6,7 +6,6 @@
 
 import { http, createConfig } from 'wagmi'
 import { defineChain } from 'viem'
-import { mainnet } from 'wagmi/chains'
 import { arcTestnet } from 'viem/chains'
 import { injected } from 'wagmi/connectors'
 import { registerChain } from './tracing'
@@ -36,11 +35,10 @@ registerChain(arcTestnet.id, arcTestnet.rpcUrls.default.http[0])
 registerChain(arcMainnet.id, 'https://rpc.mainnet.arc.io')
 
 export const config = createConfig({
-  chains: [arcTestnet, arcMainnet, mainnet],
+  chains: [arcMainnet, arcTestnet],
   connectors: [injected()],
   transports: {
-    [arcTestnet.id]: http(),
     [arcMainnet.id]: http('https://rpc.mainnet.arc.io'),
-    [mainnet.id]: http(),
+    [arcTestnet.id]: http(),
   },
 })

@@ -6,6 +6,7 @@ import { AlertCircle, ArrowRight } from 'lucide-react'
 import { useUsdcBalance } from '@/hooks/useUsdcBalance'
 import {
   ARC_MAINNET_CHAIN_ID,
+  ARC_TESTNET_CHAIN_ID,
   parseUsdc,
   formatUsdc,
   getArcNetwork,
@@ -25,6 +26,7 @@ export function AmountStep({ onNext }: Props) {
   const [error, setError] = useState('')
 
   const isWrongChain = isConnected && !network
+  const isTestnet = isConnected && network?.chainId === ARC_TESTNET_CHAIN_ID
   const isDeployed = !!network?.contractAddress
 
   const handleInput = useCallback((val: string) => {
@@ -161,6 +163,29 @@ export function AmountStep({ onNext }: Props) {
           <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" style={{ color: 'var(--muted)' }} />
           <p className="text-xs" style={{ color: 'var(--muted)' }}>
             ArcSplit contract address is not configured for this network.
+          </p>
+        </div>
+      )}
+
+      {isTestnet && (
+        <div className="flex items-center justify-between gap-3 rounded-xl px-3 py-2.5" style={{ background: 'var(--info-surface)', border: '1px solid var(--border)' }}>
+          <p className="text-xs" style={{ color: 'var(--muted)' }}>
+            Arc Testnet is for testing. Switch to Arc Mainnet for production payments.
+          </p>
+          <button
+            onClick={() => switchChain({ chainId: ARC_MAINNET_CHAIN_ID })}
+            className="min-h-9 flex-shrink-0 rounded-lg px-2 text-xs font-semibold"
+            style={{ color: 'var(--accent-hover)' }}
+          >
+            Switch to Arc Mainnet
+          </button>
+        </div>
+      )}
+
+      {isWrongChain && (
+        <div className="rounded-xl px-3 py-2.5" style={{ background: 'var(--info-surface)', border: '1px solid var(--border)' }}>
+          <p className="text-xs" style={{ color: 'var(--muted)' }}>
+            This network is not supported by ArcSplit. Switch to Arc Mainnet to make a payment.
           </p>
         </div>
       )}
