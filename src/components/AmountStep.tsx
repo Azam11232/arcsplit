@@ -155,12 +155,12 @@ export function AmountStep({ onNext }: Props) {
         </div>
       )}
 
-      {/* Contract not deployed banner */}
-      {!isDeployed && (
+      {/* Missing contract address notice */}
+      {isConnected && network && !isDeployed && (
         <div className="flex items-start gap-2 rounded-xl px-3 py-2.5" style={{ background: 'var(--info-surface)', border: '1px solid var(--border)' }}>
           <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" style={{ color: 'var(--muted)' }} />
           <p className="text-xs" style={{ color: 'var(--muted)' }}>
-            ArcSplit contract not deployed yet. Set <code className="mono text-xs">VITE_ARCSPLIT_ADDRESS</code> in your <code className="mono text-xs">.env</code> after deploying.
+            ArcSplit contract address is not configured for this network.
           </p>
         </div>
       )}
