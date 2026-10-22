@@ -131,6 +131,16 @@ export function formatUsdc(raw: bigint): string {
   return `${whole}.${fracStr}`
 }
 
+/** Round a wallet balance to cents, preserving exact display for nonzero sub-cent values. */
+export function formatUsdcBalance(raw: bigint): string {
+  const cents = (raw + 5_000n) / 10_000n
+  if (raw > 0n && cents === 0n) return formatUsdc(raw)
+
+  const whole = (cents / 100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  const fraction = (cents % 100n).toString().padStart(2, '0')
+  return `${whole}.${fraction}`
+}
+
 /** Format an address to 0x1234…5678 */
 export function shortAddress(addr: string): string {
   if (addr.length < 12) return addr

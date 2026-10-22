@@ -1,6 +1,6 @@
 import { useAccount, useReadContract } from 'wagmi'
 import { erc20Abi } from 'viem'
-import { ARC_MAINNET_CHAIN_ID, formatUsdc, getArcNetwork } from '@/utils/arcsplit'
+import { ARC_MAINNET_CHAIN_ID, formatUsdcBalance, getArcNetwork } from '@/utils/arcsplit'
 
 /**
  * Reads the connected Arc chain's ERC-20 USDC balance in 6-decimal units.
@@ -25,7 +25,7 @@ export function useUsdcBalance() {
   return {
     raw,
     decimals,
-    formatted: formatUsdc(raw),
+    formatted: formatUsdcBalance(raw),
     isLoading,
     refetch,
   }
