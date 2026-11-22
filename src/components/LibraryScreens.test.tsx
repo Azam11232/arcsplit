@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { Hash } from 'viem'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   AnalyticsScreen,
   HistoryScreen,
@@ -25,18 +25,22 @@ import { downloadPaymentReceipt } from '@/utils/paymentReceipt'
 import { formatUtcDayLabel, formatUtcMonthLabel } from '@/utils/analytics'
 import type { OnchainDistributionRecord } from '@/utils/onchainAnalytics'
 
-const mocks = vi.hoisted(() => ({
-  account: vi.fn(() => ({
-    address: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`,
-    chainId: 5042,
-  })),
-  onchainAnalytics: vi.fn(),
-  publicClient: {
-    chain: { id: 5042 },
-    getTransaction: vi.fn(),
-    getTransactionReceipt: vi.fn(),
-  },
-}))
+const mocks = vi.hoisted(() => {
+  vi.stubEnv('VITE_ARCSPLIT_MAINNET_USE_NEXT_ADDRESS', 'true')
+
+  return {
+    account: vi.fn(() => ({
+      address: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`,
+      chainId: 5042,
+    })),
+    onchainAnalytics: vi.fn(),
+    publicClient: {
+      chain: { id: 5042 },
+      getTransaction: vi.fn(),
+      getTransactionReceipt: vi.fn(),
+    },
+  }
+})
 
 vi.mock('wagmi', () => ({
   useAccount: mocks.account,
@@ -124,6 +128,7 @@ beforeEach(() => {
 })
 
 afterEach(cleanup)
+afterAll(() => vi.unstubAllEnvs())
 
 describe('Saved recipients screen', () => {
   it('adds, reuses, and removes recipients independently', () => {

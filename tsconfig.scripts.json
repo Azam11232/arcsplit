@@ -4,5 +4,5 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.scripts.tsbuildinfo",
     "types": ["node"]
   },
-  "include": ["scripts"]
+  "include": ["scripts", "middleware.ts"]
 }
