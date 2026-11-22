@@ -1,8 +1,8 @@
 import { useState, useCallback } from 'react'
 import { useAccount, useSwitchChain } from 'wagmi'
-import { ConnectKitButton } from 'connectkit'
 import { TokenUSDC } from '@web3icons/react'
 import { AlertCircle, ArrowRight } from 'lucide-react'
+import { WalletPicker } from '@/components/WalletPicker'
 import { useUsdcBalance } from '@/hooks/useUsdcBalance'
 import {
   ARC_MAINNET_CHAIN_ID,
@@ -10,19 +10,21 @@ import {
   parseUsdc,
   formatUsdc,
   getArcNetwork,
+  getUsdcInputError,
 } from '@/utils/arcsplit'
 
 interface Props {
+  initialAmountRaw: bigint
   onNext: (amountRaw: bigint) => void
 }
 
-export function AmountStep({ onNext }: Props) {
+export function AmountStep({ initialAmountRaw, onNext }: Props) {
   const { address, chainId, isConnected } = useAccount()
-  const { switchChain } = useSwitchChain()
+  const { mutate: switchChain } = useSwitchChain()
   const network = getArcNetwork(chainId)
   const { raw: balanceRaw, formatted: balanceFormatted, isLoading: balanceLoading } = useUsdcBalance()
 
-  const [input, setInput] = useState('')
+  const [input, setInput] = useState(() => initialAmountRaw > 0n ? formatUsdc(initialAmountRaw) : '')
   const [error, setError] = useState('')
 
   const isWrongChain = isConnected && !network
@@ -30,15 +32,8 @@ export function AmountStep({ onNext }: Props) {
   const isDeployed = !!network?.contractAddress
 
   const handleInput = useCallback((val: string) => {
-    const clean = val.replace(/[^0-9.]/g, '')
-    if (/^\d*\.?\d*$/.test(clean) && clean.split('.')[1]?.length > 6) {
-      setError('USDC amounts support up to 6 decimal places.')
-      return
-    }
-    if (clean === '' || /^\d*\.?\d{0,6}$/.test(clean)) {
-      setInput(clean)
-      setError('')
-    }
+    setInput(val)
+    setError(getUsdcInputError(val) ?? '')
   }, [])
 
   const handleMax = useCallback(() => {
@@ -49,8 +44,13 @@ export function AmountStep({ onNext }: Props) {
   }, [balanceRaw])
 
   const handleContinue = useCallback(() => {
-    if (!input || input === '0' || input === '0.00') {
+    if (!input || input === '0' || input === '0.00' || input === '.') {
       setError('Enter an amount greater than zero.')
+      return
+    }
+    const inputError = getUsdcInputError(input)
+    if (inputError) {
+      setError(inputError)
       return
     }
     let raw: bigint
@@ -119,6 +119,7 @@ export function AmountStep({ onNext }: Props) {
         </label>
         <div className="flex items-center gap-2">
           <input
+            type="text"
             inputMode="decimal"
             value={input}
             onChange={(e) => handleInput(e.target.value)}
@@ -192,17 +193,7 @@ export function AmountStep({ onNext }: Props) {
 
       {/* CTA */}
       {!isConnected ? (
-        <ConnectKitButton.Custom>
-          {({ show }) => (
-            <button
-              onClick={show}
-              className="min-h-12 w-full rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110"
-              style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.2)' }}
-            >
-              Connect Wallet
-            </button>
-          )}
-        </ConnectKitButton.Custom>
+        <WalletPicker variant="primary" />
       ) : isWrongChain ? (
         <button
           onClick={() => switchChain({ chainId: ARC_MAINNET_CHAIN_ID })}
@@ -214,7 +205,7 @@ export function AmountStep({ onNext }: Props) {
       ) : (
         <button
           onClick={handleContinue}
-          disabled={!input || !isDeployed}
+          disabled={!input || !isDeployed || !!error}
           className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
           style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.2)' }}
         >

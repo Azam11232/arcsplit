@@ -23,9 +23,7 @@ contract FailingRecipientToken {
         return true;
     }
 
-    function transferFrom(address from, address to, uint256 amount)
-        external returns (bool)
-    {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
         require(balanceOf[from] >= amount, "insufficient balance");
         require(allowance[from][msg.sender] >= amount, "insufficient allowance");
 
@@ -39,6 +37,54 @@ contract FailingRecipientToken {
         require(to != failingRecipient, "recipient transfer failed");
         require(balanceOf[msg.sender] >= amount, "insufficient balance");
 
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+contract ReentrantToken {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    address public splitter;
+    bool public reentryAttempted;
+    bool public reentrySucceeded;
+
+    function setSplitter(address splitter_) external {
+        splitter = splitter_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        if (!reentryAttempted && splitter != address(0)) {
+            reentryAttempted = true;
+            address[] memory recipients = new address[](1);
+            recipients[0] = address(0x4444);
+            uint256[] memory amounts = new uint256[](1);
+            amounts[0] = 1;
+            (reentrySucceeded,) =
+                splitter.call(abi.encodeWithSelector(ArcSplit.distributeFixedAmounts.selector, recipients, amounts));
+        }
+
+        require(balanceOf[from] >= amount, "insufficient balance");
+        require(allowance[from][msg.sender] >= amount, "insufficient allowance");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "insufficient balance");
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
         return true;
@@ -87,5 +133,54 @@ contract ArcSplitRollbackTest is Test {
         assertEq(token.balanceOf(alice), aliceBefore);
         assertEq(token.balanceOf(bob), bobBefore);
         assertEq(token.allowance(payer, address(splitter)), allowanceBefore);
+    }
+
+    function test_FixedAmountSecondRecipientFailureRollsBackEverything() public {
+        address[] memory recipients = new address[](2);
+        recipients[0] = alice;
+        recipients[1] = bob;
+
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = 60e6;
+        amounts[1] = 40e6;
+
+        uint256 payerBefore = token.balanceOf(payer);
+        uint256 splitterBefore = token.balanceOf(address(splitter));
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256 bobBefore = token.balanceOf(bob);
+        uint256 allowanceBefore = token.allowance(payer, address(splitter));
+
+        vm.prank(payer);
+        vm.expectRevert(bytes("recipient transfer failed"));
+        splitter.distributeFixedAmounts(recipients, amounts);
+
+        assertEq(token.balanceOf(payer), payerBefore);
+        assertEq(token.balanceOf(address(splitter)), splitterBefore);
+        assertEq(token.balanceOf(alice), aliceBefore);
+        assertEq(token.balanceOf(bob), bobBefore);
+        assertEq(token.allowance(payer, address(splitter)), allowanceBefore);
+    }
+
+    function test_FixedAmountReentrantTokenCallbackIsBlocked() public {
+        ReentrantToken reentrantToken = new ReentrantToken();
+        ArcSplit reentrantSplitter = new ArcSplit(address(reentrantToken));
+        reentrantToken.setSplitter(address(reentrantSplitter));
+        reentrantToken.mint(payer, 10e6);
+
+        vm.prank(payer);
+        reentrantToken.approve(address(reentrantSplitter), 10e6);
+
+        address[] memory recipients = new address[](1);
+        recipients[0] = alice;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 10e6;
+
+        vm.prank(payer);
+        reentrantSplitter.distributeFixedAmounts(recipients, amounts);
+
+        assertTrue(reentrantToken.reentryAttempted());
+        assertFalse(reentrantToken.reentrySucceeded());
+        assertEq(reentrantToken.balanceOf(alice), 10e6);
+        assertEq(reentrantToken.balanceOf(address(reentrantSplitter)), 0);
     }
 }

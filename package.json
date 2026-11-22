@@ -10,7 +10,7 @@
     "deploy:self": "bun run ./scripts/self-deploy.ts",
     "compass:deploy": "bun run ./scripts/compass-deploy.ts",
     "fetch:abi": "bun run ./scripts/fetch-abi.ts",
-    "lint": "oxlint --type-aware src scripts --fix; s=$?; oxlint --fix .; exit $((s>0?s:$?))",
+    "lint": "oxlint --type-aware src scripts && oxlint .",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
     "check": "bash scripts/check.sh",
@@ -18,29 +18,22 @@
     "contracts:test": "forge test"
   },
   "dependencies": {
-    "@circle-fin/adapter-viem-v2": "^1.18.0",
-    "@circle-fin/app-kit": "^1.15.2",
     "@circle-fin/developer-controlled-wallets": "^10.8.0",
-    "@circle-fin/modular-wallets-core": "^1.0.16",
     "@circle-fin/smart-contract-platform": "^10.8.0",
-    "@circle-fin/user-controlled-wallets": "^10.8.0",
-    "@circle-fin/w3s-pw-web-sdk": "^1.1.11",
     "@openzeppelin/contracts": "5.1.0",
     "@tanstack/react-query": "^5.62.7",
+    "@wagmi/connectors": "8.2.4",
     "@web3icons/react": "^4.0.0",
     "clsx": "^2.1.1",
-    "connectkit": "^1.9.2",
     "framer-motion": "^11.15.0",
+    "jspdf": "^4.2.1",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "sonner": "^1.7.1",
     "tailwind-merge": "^2.6.0",
-    "viem": "^2.56.3",
-    "wagmi": "^2.19.5"
-  },
-  "overrides": {
-    "viem": "^2.56.3"
+    "viem": "^2.58.4",
+    "wagmi": "3.7.11"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.2",
@@ -57,7 +50,6 @@
     "tailwindcss": "^3.4.17",
     "typescript": "~7.0.2",
     "vite": "^6.0.5",
-    "vite-plugin-node-polyfills": "^0.22.0",
-    "vitest": "^3.2.7"
+    "vitest": "4.1.12"
   }
 }

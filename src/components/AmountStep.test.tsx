@@ -1,4 +1,3 @@
-import type { ReactNode } from 'react'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AmountStep } from './AmountStep'
@@ -20,14 +19,11 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('wagmi', () => ({
   useAccount: mocks.account,
-  useSwitchChain: () => ({ switchChain: mocks.switchChain }),
+  useSwitchChain: () => ({ mutate: mocks.switchChain }),
 }))
 
-vi.mock('connectkit', () => ({
-  ConnectKitButton: {
-    Custom: ({ children }: { children: (props: { show: () => void }) => ReactNode }) =>
-      children({ show: vi.fn() }),
-  },
+vi.mock('@/components/WalletPicker', () => ({
+  WalletPicker: () => <button type="button">Connect Wallet</button>,
 }))
 
 vi.mock('@web3icons/react', () => ({
@@ -35,19 +31,20 @@ vi.mock('@web3icons/react', () => ({
 }))
 
 vi.mock('@/hooks/useUsdcBalance', () => ({
-  useUsdcBalance: () => ({ raw: 0n, formatted: '0.00', isLoading: false }),
+  useUsdcBalance: () => ({ raw: 1_000_000_000n, formatted: '1,000.00', isLoading: false }),
 }))
 
-vi.mock('@/utils/arcsplit', () => ({
-  ARC_MAINNET_CHAIN_ID: 5042,
-  ARC_TESTNET_CHAIN_ID: 5042002,
-  formatUsdc: vi.fn(() => '0.00'),
+vi.mock('@/utils/arcsplit', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/utils/arcsplit')>(),
   getArcNetwork: mocks.getArcNetwork,
-  parseUsdc: vi.fn(() => 1_000_000n),
 }))
 
 function renderAmountStep() {
-  return render(<AmountStep onNext={vi.fn()} />)
+  const onNext = vi.fn()
+  const view = render(
+    <AmountStep initialAmountRaw={0n} onNext={onNext} />,
+  )
+  return { ...view, onNext }
 }
 
 beforeEach(() => {
@@ -59,7 +56,16 @@ beforeEach(() => {
 
 afterEach(cleanup)
 
-describe('AmountStep contract address notice', () => {
+describe('AmountStep', () => {
+  it('keeps library sections off the Send screen', () => {
+    renderAmountStep()
+
+    expect(screen.queryByRole('button', { name: /saved/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /templates/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /history/i })).toBeNull()
+    expect(screen.getByRole<HTMLInputElement>('textbox', { name: 'USDC amount to split' }).value).toBe('')
+  })
+
   it('does not show the notice when the wallet is disconnected', () => {
     renderAmountStep()
 
@@ -148,5 +154,50 @@ describe('AmountStep contract address notice', () => {
     fireEvent.click(switchButton)
 
     expect(mocks.switchChain).toHaveBeenCalledWith({ chainId: 5042 })
+  })
+})
+
+describe('raw decimal input', () => {
+  beforeEach(() => {
+    mocks.account.mockReturnValue({
+      chainId: 5042,
+      isConnected: true,
+      address: '0x1111111111111111111111111111111111111111',
+    })
+    mocks.network = {
+      chainId: 5042,
+      name: 'Arc Mainnet',
+      contractAddress: '0x2222222222222222222222222222222222222222',
+    }
+  })
+
+  it.each([
+    ['0.1', 100_000n],
+    ['0.11', 110_000n],
+    ['1.20', 1_200_000n],
+    ['0.000001', 1n],
+    ['10.50', 10_500_000n],
+    ['100', 100_000_000n],
+  ])('preserves %s while typing and sends its exact base-unit value', (value, expectedRaw) => {
+    const { onNext } = renderAmountStep()
+    const input = screen.getByRole('textbox', { name: 'USDC amount to split' }) as HTMLInputElement
+
+    fireEvent.change(input, { target: { value } })
+    expect(input.value).toBe(value)
+
+    fireEvent.click(screen.getByRole('button', { name: /continue/i }))
+    expect(onNext).toHaveBeenCalledWith(expectedRaw)
+  })
+
+  it('keeps over-precision input visible and prevents continuing', () => {
+    const { onNext } = renderAmountStep()
+    const input = screen.getByRole('textbox', { name: 'USDC amount to split' }) as HTMLInputElement
+
+    fireEvent.change(input, { target: { value: '0.0000001' } })
+
+    expect(input.value).toBe('0.0000001')
+    expect(screen.getByRole('alert').textContent).toContain('up to 6 decimal places')
+    expect(screen.getByRole('button', { name: /continue/i }).hasAttribute('disabled')).toBe(true)
+    expect(onNext).not.toHaveBeenCalled()
   })
 })

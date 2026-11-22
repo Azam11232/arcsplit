@@ -15,7 +15,8 @@ This is the **project memory** - what Arc Studio remembers about building this a
 ## Tech Stack
 
 - Frontend: React 18, Vite, TypeScript, Tailwind CSS
-- Web3: wagmi v2, viem v2, ConnectKit
+- Web3: wagmi 3.7.11, @wagmi/connectors 8.2.4, viem v2
+- Wallet UI: custom wallet picker backed by the injected connector
 - Contracts: Solidity 0.8.28 + Foundry. Sources in `contracts/`, unit tests in `contracts/test/*.t.sol`. Build with `bun run contracts:build` (`forge build`), test with `bun run contracts:test` (`forge test`).
 - Wallet: injected (MetaMask, etc.)
 - Chain: Arc Testnet (Chain ID: 5042002, imported from `viem/chains`)

@@ -1,12 +1,12 @@
 # ArcSplit
 
-A beginner-friendly, non-custodial USDC payment-splitting app on Arc Testnet.
+A beginner-friendly, non-custodial USDC payment-splitting app for Arc Mainnet, with Arc Testnet available in local development.
 
 ---
 
 ## What It Does
 
-ArcSplit lets you split a USDC payment across multiple wallet addresses in one transaction. You set the total amount and assign a percentage share to each recipient. The app:
+ArcSplit lets you distribute a USDC payment across multiple wallet addresses in one atomic contract call. You set the total amount and assign a percentage share to each recipient. After allowance approval, the app:
 
 1. Asks you to **approve** the ArcSplit contract to spend your USDC.
 2. Calls **distribute()**, which atomically pulls USDC from your wallet and sends the correct share to each recipient.
@@ -43,7 +43,8 @@ Browser wallet (payer)
 ### Frontend (`src/`)
 
 - React + TypeScript + Vite
-- wagmi v2 + ConnectKit for wallet connection
+- wagmi 3 + the injected connector and ArcSplit's custom wallet picker
+- Arc Mainnet and Arc Testnet network switching in local development; production builds expose Arc Mainnet only
 - Three-step wizard: Amount → Recipients → Review
 - Real onchain balance and allowance reads
 - Explicit two-transaction flow (approve + distribute) with per-step status
@@ -56,7 +57,8 @@ Browser wallet (payer)
 
 - [Bun](https://bun.sh) 1.x
 - [Foundry](https://getfoundry.sh) (for contract compilation and tests)
-- A browser wallet (MetaMask, etc.) with Arc Testnet configured
+- A browser-injected wallet (MetaMask, etc.)
+- Arc Testnet configured in the wallet when exercising Testnet flows locally
 - Testnet USDC — use the **Get test USDC** button in Arc Studio's sidebar
 
 ### Install & Run
@@ -142,11 +144,12 @@ This contract was reviewed at the **balanced** level (Critical + High findings) 
 | Integer overflow protection | Solidity ^0.8 built-in overflow checks |
 | Slither static analysis | Zero actionable findings |
 | Automated unit tests | 23/23 passing (fuzz + invariant) |
-| Not deployed to mainnet | Testnet only — review before any mainnet use |
+| Contract deployment | This migration did not deploy or change any contract; verify the selected network and contract target before use |
 
-**Important:** This is a testnet implementation for learning. Before deploying to mainnet or handling real funds:
+**Important:** Do not treat this candidate as production-ready. Before handling real funds:
 - Obtain an independent professional security audit
 - Verify the USDC address for your target chain from official Circle docs
+- Verify the active contract address, deployment provenance, and Mainnet-only production configuration
 - Test thoroughly on testnet with your actual use case
 - Understand that mainnet transactions are irreversible
 

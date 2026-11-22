@@ -1,6 +1,10 @@
 import { useCallback, useState } from 'react'
-import { Plus, Trash2, ArrowRight, ArrowLeft, AlertCircle, UserPlus } from 'lucide-react'
-import { Recipient, isValidAddress, formatUsdc, computePayouts } from '@/utils/arcsplit'
+import { Plus, Trash2, ArrowRight, ArrowLeft, AlertCircle, UserPlus, Bookmark } from 'lucide-react'
+import { useAccount } from 'wagmi'
+import { toast } from 'sonner'
+import { getArcNetwork, getUsdcInputError, isValidAddress, formatUsdc, parseUsdc, splitFixedAmountsEvenly } from '@/utils/arcsplit'
+import type { Recipient } from '@/utils/arcsplit'
+import { saveRecipient } from '@/utils/splitStorage'
 
 interface Props {
   amountRaw: bigint
@@ -10,36 +14,50 @@ interface Props {
   onBack: () => void
 }
 
+interface AmountDraft {
+  value: string
+  amountRaw: bigint
+  error?: string
+}
+
 function generateId() {
   return Math.random().toString(36).slice(2, 9)
 }
 
-function sumBps(recipients: Recipient[]) {
-  return recipients.reduce((s, r) => s + r.sharesBps, 0)
+function shortName(address: string) {
+  return `${address.slice(0, 6)}…${address.slice(-4)}`
 }
 
 export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack }: Props) {
+  const { address: accountAddress, chainId } = useAccount()
+  const canSaveRecipient = !!accountAddress && !!getArcNetwork(chainId)
   const [errors, setErrors] = useState<Record<string, string>>({})
+  const [amountDrafts, setAmountDrafts] = useState<Record<string, AmountDraft>>({})
   const [globalError, setGlobalError] = useState('')
-
-  const payouts = computePayouts(recipients, amountRaw)
-  const total = sumBps(recipients)
-  const remaining = 10000 - total
+  const fixedTotal = recipients.reduce((sum, recipient) => sum + recipient.amountRaw, 0n)
+  const fixedRemaining = amountRaw - fixedTotal
 
   const addRecipient = useCallback(() => {
     if (recipients.length >= 50) return
     const id = generateId()
-    // Auto-assign remaining share to the new recipient, but never exceed 10000
-    const auto = Math.max(0, Math.min(remaining, 10000 - sumBps(recipients)))
-    onChange([...recipients, { id, address: '', sharesBps: auto }])
+    onChange([...recipients, {
+      id,
+      address: '',
+      amountRaw: fixedRemaining > 0n ? fixedRemaining : 0n,
+    }])
     setGlobalError('')
-  }, [recipients, remaining, onChange])
+  }, [recipients, fixedRemaining, onChange])
 
   const removeRecipient = useCallback(
     (id: string) => {
       const next = recipients.filter((r) => r.id !== id)
       setErrors((e) => {
         const copy = { ...e }
+        delete copy[id]
+        return copy
+      })
+      setAmountDrafts((drafts) => {
+        const copy = { ...drafts }
         delete copy[id]
         return copy
       })
@@ -57,28 +75,52 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
     [recipients, onChange]
   )
 
-  const updateShares = useCallback(
+  const updateFixedAmount = useCallback(
     (id: string, raw: string) => {
-      const val = raw.replace(/[^0-9]/g, '')
-      const num = Math.min(10000, Math.max(0, parseInt(val || '0', 10)))
-      onChange(recipients.map((r) => (r.id === id ? { ...r, sharesBps: num } : r)))
+      const error = getUsdcInputError(raw)
+      let amount = 0n
+      if (!error && raw !== '' && raw !== '.') {
+        try {
+          amount = parseUsdc(raw)
+        } catch {
+          setAmountDrafts((drafts) => ({
+            ...drafts,
+            [id]: { value: raw, amountRaw: 0n, error: 'Enter a valid USDC amount.' },
+          }))
+          onChange(recipients.map((recipient) =>
+            recipient.id === id ? { ...recipient, amountRaw: 0n } : recipient,
+          ))
+          setGlobalError('')
+          return
+        }
+      }
+      setAmountDrafts((drafts) => ({
+        ...drafts,
+        [id]: { value: raw, amountRaw: error ? 0n : amount, error },
+      }))
+      setErrors((current) => ({ ...current, [id]: '' }))
+      onChange(recipients.map((recipient) =>
+        recipient.id === id ? { ...recipient, amountRaw: error ? 0n : amount } : recipient,
+      ))
       setGlobalError('')
     },
-    [recipients, onChange]
+    [recipients, onChange],
   )
 
-  const setEqual = useCallback(() => {
+  const setFixedEqual = useCallback(() => {
     if (recipients.length === 0) return
-    const base = Math.floor(10000 / recipients.length)
-    const rem = 10000 - base * (recipients.length - 1)
-    onChange(
-      recipients.map((r, i) => ({
-        ...r,
-        sharesBps: i === recipients.length - 1 ? rem : base,
-      }))
-    )
-    setGlobalError('')
-  }, [recipients, onChange])
+    const equalAmounts = splitFixedAmountsEvenly(amountRaw, recipients.length)
+    setAmountDrafts({})
+    setErrors({})
+    if (equalAmounts.length > 0 && equalAmounts.some((amount) => amount === 0n) && equalAmounts.length > 1) {
+      setGlobalError('Cannot divide this amount equally into more than one positive USDC payout.')
+    }
+    onChange(recipients.map((recipient, index) => ({
+      ...recipient,
+      amountRaw: equalAmounts[index] ?? 0n,
+    })))
+    if (equalAmounts.every((amount) => amount > 0n)) setGlobalError('')
+  }, [amountRaw, recipients, onChange])
 
   const validate = useCallback((): boolean => {
     const newErrors: Record<string, string> = {}
@@ -91,6 +133,11 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
 
     const seen = new Set<string>()
     for (const r of recipients) {
+      const draft = amountDrafts[r.id]?.amountRaw === r.amountRaw ? amountDrafts[r.id] : undefined
+      if (draft?.error) {
+        newErrors[r.id] = draft.error
+        ok = false
+      }
       if (!r.address) {
         newErrors[r.id] = 'Enter a wallet address.'
         ok = false
@@ -105,15 +152,17 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
       } else {
         seen.add(r.address.toLowerCase())
       }
-      if (r.sharesBps === 0) {
-        newErrors[r.id] = (newErrors[r.id] ? newErrors[r.id] + ' ' : '') + 'Share must be > 0.'
+      if (r.amountRaw === 0n) {
+        if (!newErrors[r.id]) newErrors[r.id] = 'Amount must be greater than zero.'
         ok = false
       }
     }
 
-    if (total !== 10000) {
+    if (fixedTotal !== amountRaw) {
       setGlobalError(
-        `Shares must add up to 100% (10,000 bps). Currently ${(total / 100).toFixed(2)}%.`
+        fixedRemaining > 0n
+          ? `${formatUsdc(fixedRemaining)} USDC remaining to allocate.`
+          : `Over-allocation by ${formatUsdc(-fixedRemaining)} USDC.`,
       )
       ok = false
     } else {
@@ -122,11 +171,15 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
 
     setErrors(newErrors)
     return ok
-  }, [recipients, total])
+  }, [recipients, amountDrafts, fixedTotal, amountRaw, fixedRemaining])
 
   const handleNext = useCallback(() => {
     if (validate()) onNext()
   }, [validate, onNext])
+  const hasInvalidAmountInput = recipients.some((recipient) => {
+    const draft = amountDrafts[recipient.id]
+    return draft?.amountRaw === recipient.amountRaw && !!draft.error
+  })
 
   return (
     <div className="flex flex-col gap-4">
@@ -145,7 +198,7 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
         </div>
         {recipients.length > 1 && (
           <button
-            onClick={setEqual}
+            onClick={setFixedEqual}
             className="rounded-xl px-3 py-1.5 text-xs font-semibold transition-all hover:opacity-80"
             style={{ background: 'var(--surface-muted)', color: 'var(--ink-2)', border: '1px solid var(--border)' }}
           >
@@ -157,15 +210,18 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
       {/* Recipient rows */}
       <div className="flex flex-col gap-3">
         {recipients.map((r, idx) => {
-          const payout = payouts[idx] ?? 0n
           const rowError = errors[r.id]
+          const amountDraft = amountDrafts[r.id]?.amountRaw === r.amountRaw
+            ? amountDrafts[r.id]
+            : undefined
+          const message = amountDraft?.error || rowError
           return (
             <div
               key={r.id}
               className="recipient-card rounded-2xl p-4 sm:p-5"
               style={{
                 background: 'var(--surface-strong)',
-                border: rowError ? '1.5px solid var(--danger)' : '1.5px solid var(--border)',
+                border: message ? '1.5px solid var(--danger)' : '1.5px solid var(--border)',
                 backdropFilter: 'blur(10px)',
               }}
             >
@@ -200,36 +256,39 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
                 aria-label={`Recipient ${idx + 1} address`}
               />
 
-              {/* Share + payout */}
               <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                 <div className="flex min-w-0 flex-1 items-center gap-2">
                   <input
-                    type="number"
-                    min={1}
-                    max={10000}
-                    value={r.sharesBps === 0 ? '' : r.sharesBps}
-                    onChange={(e) => updateShares(r.id, e.target.value)}
-                    placeholder="bps"
-                    className="w-24 max-w-[40%] rounded-xl px-3 py-2.5 text-sm font-semibold tabular-nums outline-none"
-                    style={{
-                      color: 'var(--ink)',
-                      background: 'var(--surface-muted)',
-                      border: '1px solid var(--border)',
-                    }}
-                    aria-label={`Recipient ${idx + 1} basis points`}
+                    type="text"
+                    inputMode="decimal"
+                    value={amountDraft?.value ?? (r.amountRaw > 0n ? formatUsdc(r.amountRaw) : '')}
+                    onChange={(event) => updateFixedAmount(r.id, event.target.value)}
+                    placeholder="0.00"
+                    className="w-32 rounded-xl px-3 py-2.5 text-sm font-semibold tabular-nums outline-none"
+                    style={{ color: 'var(--ink)', background: 'var(--surface-muted)', border: '1px solid var(--border)' }}
+                    aria-label={`Recipient ${idx + 1} USDC amount`}
+                    aria-invalid={!!amountDraft?.error || !!rowError}
                   />
-                  <span className="whitespace-nowrap text-sm font-medium tabular-nums" style={{ color: 'var(--muted)' }}>
-                    = {(r.sharesBps / 100).toFixed(2)}%
-                  </span>
+                  <span className="text-sm font-medium" style={{ color: 'var(--muted)' }}>USDC</span>
                 </div>
-                <span className="ml-auto whitespace-nowrap text-sm font-semibold tabular-nums" style={{ color: 'var(--ink)' }}>
-                  {formatUsdc(payout)} USDC
-                </span>
+                {canSaveRecipient && r.address && isValidAddress(r.address) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      saveRecipient(accountAddress, chainId, { name: shortName(r.address), address: r.address })
+                      toast.success('Recipient saved for this wallet and network.')
+                    }}
+                    className="flex h-9 items-center gap-1 rounded-xl px-2 text-[11px] font-semibold"
+                    style={{ color: 'var(--accent-hover)', background: 'var(--info-surface)', border: '1px solid var(--border)' }}
+                  >
+                    <Bookmark className="h-3 w-3" /> Save
+                  </button>
+                )}
               </div>
 
-              {rowError && (
+              {message && (
                 <p role="alert" className="mt-2 rounded-lg px-2.5 py-2 text-xs leading-relaxed" style={{ color: 'var(--danger)', background: 'var(--danger-surface)' }}>
-                  {rowError}
+                  {message}
                 </p>
               )}
             </div>
@@ -260,26 +319,34 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
         </button>
       )}
 
-      {/* Share total indicator */}
-      {recipients.length > 0 && (
-        <div
-          className="flex items-center justify-between rounded-xl px-4 py-2.5"
-          style={{
-            background: total === 10000 ? 'var(--success-surface)' : 'var(--danger-surface)',
-            border: `1px solid ${total === 10000 ? 'var(--success-border)' : 'var(--danger-border)'}`,
-          }}
-        >
-          <span className="text-xs font-medium" style={{ color: total === 10000 ? 'var(--success)' : 'var(--danger)' }}>
-            {total === 10000 ? 'Shares add up to 100%' : `Remaining: ${(remaining / 100).toFixed(2)}%`}
+      <div
+        className="rounded-xl px-4 py-3"
+        style={{
+          background: fixedTotal === amountRaw ? 'var(--success-surface)' : fixedTotal > amountRaw ? 'var(--danger-surface)' : 'var(--warning-surface)',
+          border: `1px solid ${fixedTotal === amountRaw ? 'var(--success-border)' : fixedTotal > amountRaw ? 'var(--danger-border)' : 'var(--warning-border)'}`,
+        }}
+        aria-live="polite"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-xs font-medium" style={{ color: fixedTotal === amountRaw ? 'var(--success)' : fixedTotal > amountRaw ? 'var(--danger)' : 'var(--warning)' }}>
+            {fixedTotal === amountRaw ? 'Allocation complete' : fixedTotal > amountRaw ? 'Over-allocation' : 'Remaining'}
           </span>
-          <span
-            className="display text-sm font-bold tabular-nums"
-            style={{ color: total === 10000 ? 'var(--success)' : 'var(--danger)' }}
-          >
-            {(total / 100).toFixed(2)}% / 100%
+          <span className="display text-sm font-bold tabular-nums" style={{ color: fixedTotal === amountRaw ? 'var(--success)' : fixedTotal > amountRaw ? 'var(--danger)' : 'var(--warning)' }}>
+            {formatUsdc(fixedTotal)} / {formatUsdc(amountRaw)} USDC allocated
           </span>
         </div>
-      )}
+        {fixedRemaining !== 0n && (
+          <p
+            role={fixedRemaining < 0n ? 'alert' : 'status'}
+            className="mt-1 text-right text-xs font-semibold tabular-nums"
+            style={{ color: fixedRemaining > 0n ? 'var(--warning)' : 'var(--danger)' }}
+          >
+            {fixedRemaining > 0n
+              ? `${formatUsdc(fixedRemaining)} USDC remaining`
+              : `Over-allocation by ${formatUsdc(-fixedRemaining)} USDC`}
+          </p>
+        )}
+      </div>
 
       {/* Global error */}
       {globalError && (
@@ -300,7 +367,7 @@ export function RecipientsStep({ amountRaw, recipients, onChange, onNext, onBack
         </button>
         <button
           onClick={handleNext}
-          disabled={recipients.length === 0}
+          disabled={recipients.length === 0 || fixedTotal !== amountRaw || hasInvalidAmountInput}
           className="flex min-h-12 flex-1 items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
           style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.18)' }}
         >

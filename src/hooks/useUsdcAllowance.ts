@@ -9,7 +9,7 @@ export function useUsdcAllowance() {
   const { address, chainId } = useAccount()
   const network = getArcNetwork(chainId)
 
-  const { data: raw, isLoading, refetch } = useReadContract({
+  const { data: raw, error, isError, isLoading, isFetching, refetch } = useReadContract({
     address: network?.usdcAddress,
     abi: erc20Abi,
     functionName: 'allowance',
@@ -17,12 +17,20 @@ export function useUsdcAllowance() {
       ? [address, network.contractAddress]
       : undefined,
     chainId: network?.chainId ?? ARC_MAINNET_CHAIN_ID,
-    query: { enabled: !!address && !!network?.contractAddress },
+    query: {
+      enabled: !!address && !!network?.contractAddress,
+      refetchOnMount: 'always',
+      refetchOnWindowFocus: true,
+      staleTime: 0,
+    },
   })
 
   return {
     raw: (raw) ?? 0n,
     isLoading,
+    isFetching,
+    isError,
+    error,
     refetch,
   }
 }

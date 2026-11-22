@@ -1,35 +1,41 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useAccount, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi'
+import { useAccount, useWriteContract, useWaitForTransactionReceipt, useSwitchChain, useSimulateContract } from 'wagmi'
 import { erc20Abi, WaitForTransactionReceiptTimeoutError } from 'viem'
 import { Loader2, ArrowLeft, ExternalLink, Check, AlertCircle, ArrowRight } from 'lucide-react'
 import { TokenUSDC } from '@web3icons/react'
 import { toast } from 'sonner'
 import {
-  Recipient,
-  computePayouts,
   formatUsdc,
   shortAddress,
   parseContractError,
   txUrl,
-  ARCSPLIT_ABI,
+  ARCSPLIT_FIXED_ABI,
   ARC_MAINNET_CHAIN_ID,
   getArcNetwork,
+  isValidAddress,
 } from '@/utils/arcsplit'
+import type { Recipient } from '@/utils/arcsplit'
 import { useUsdcAllowance } from '@/hooks/useUsdcAllowance'
 import { useUsdcBalance } from '@/hooks/useUsdcBalance'
 import { playSuccessSound } from '@/utils/successSound'
+import { addHistoryEntry } from '@/utils/splitStorage'
+import {
+  clearPendingTransaction,
+  getPendingTransaction,
+  savePendingTransaction,
+} from '@/utils/pendingTransaction'
 
 interface Props {
   amountRaw: bigint
   recipients: Recipient[]
   onBack: () => void
   onReset: () => void
+  onDistributionConfirmed?: () => void
 }
 
 const soundedDistributionHashes = new Set<`0x${string}`>()
 
-// Track which step has been initiated in this session
-type TxPhase = 'idle' | 'approving' | 'approved' | 'distributing'
+type TxPhase = 'idle' | 'approving' | 'distributing'
 
 function receiptErrorMessage(error: Error | null, action: string): string {
   if (error instanceof WaitForTransactionReceiptTimeoutError) {
@@ -38,26 +44,148 @@ function receiptErrorMessage(error: Error | null, action: string): string {
   return `Could not retrieve the ${action} receipt. The transaction outcome is unknown; check the explorer or retry the status check.`
 }
 
-export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
-  const { chainId } = useAccount()
+function detailedErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return error
+  if (!error || typeof error !== 'object') return 'The operation failed for an unknown reason.'
+
+  const candidate = error as {
+    shortMessage?: unknown
+    details?: unknown
+    message?: unknown
+    cause?: unknown
+  }
+  const primary = typeof candidate.shortMessage === 'string'
+    ? candidate.shortMessage
+    : typeof candidate.message === 'string'
+      ? candidate.message
+      : 'The operation failed.'
+  const detail = typeof candidate.details === 'string'
+    ? candidate.details
+    : candidate.cause && typeof candidate.cause === 'object'
+      && 'shortMessage' in candidate.cause
+      && typeof candidate.cause.shortMessage === 'string'
+      ? candidate.cause.shortMessage
+      : undefined
+
+  return detail && detail !== primary ? `${primary}: ${detail}` : primary
+}
+
+function transactionErrorMessage(error: unknown): string {
+  const parsed = parseContractError(error)
+  return parsed === 'Transaction failed. Please try again.'
+    ? detailedErrorMessage(error)
+    : parsed
+}
+
+export function ReviewStep({
+  amountRaw,
+  recipients,
+  onBack,
+  onReset,
+  onDistributionConfirmed,
+}: Props) {
+  const { address: accountAddress, chainId } = useAccount()
   const network = getArcNetwork(chainId)
   const { switchChain, isPending: isSwitching } = useSwitchChain()
-  const { raw: allowance, refetch: refetchAllowance } = useUsdcAllowance()
-  const { raw: balance, refetch: refetchBalance } = useUsdcBalance()
+  const {
+    raw: allowance,
+    isError: allowanceReadFailed,
+    error: allowanceReadError,
+    isLoading: allowanceLoading,
+    isFetching: allowanceFetching,
+    refetch: refetchAllowance,
+  } = useUsdcAllowance()
+  const {
+    raw: balance,
+    isError: balanceReadFailed,
+    error: balanceReadError,
+    isLoading: balanceLoading,
+    isFetching: balanceFetching,
+    refetch: refetchBalance,
+  } = useUsdcBalance()
 
-  const [txPhase, setTxPhase] = useState<TxPhase>('idle')
+  const [initialPending] = useState(() =>
+    getPendingTransaction(accountAddress, chainId, network?.contractAddress),
+  )
+  const [txPhase, setTxPhase] = useState<TxPhase>(
+    initialPending?.kind === 'approval'
+      ? 'approving'
+      : initialPending?.kind === 'distribution'
+        ? 'distributing'
+        : 'idle',
+  )
   const [error, setError] = useState('')
-  const [approveTxHash, setApproveTxHash] = useState<`0x${string}` | undefined>()
-  const [approveTxChainId, setApproveTxChainId] = useState<number | undefined>()
-  const [distributeTxHash, setDistributeTxHash] = useState<`0x${string}` | undefined>()
-  const [distributeTxChainId, setDistributeTxChainId] = useState<number | undefined>()
+  const [approveTxHash, setApproveTxHash] = useState<`0x${string}` | undefined>(
+    initialPending?.kind === 'approval' ? initialPending.txHash : undefined,
+  )
+  const [approveTxChainId, setApproveTxChainId] = useState<number | undefined>(
+    initialPending?.kind === 'approval' ? chainId : undefined,
+  )
+  const [distributeTxHash, setDistributeTxHash] = useState<`0x${string}` | undefined>(
+    initialPending?.kind === 'distribution' ? initialPending.txHash : undefined,
+  )
+  const [distributeTxChainId, setDistributeTxChainId] = useState<number | undefined>(
+    initialPending?.kind === 'distribution' ? chainId : undefined,
+  )
+  const [approvalContext, setApprovalContext] = useState<{
+    address: `0x${string}` | undefined
+    chainId: number | undefined
+    contractAddress?: `0x${string}`
+  } | undefined>(initialPending?.kind === 'approval'
+    ? { address: accountAddress, chainId, contractAddress: initialPending.contractAddress }
+    : undefined)
+  const [distributionContext, setDistributionContext] = useState<{
+    address: `0x${string}` | undefined
+    chainId: number | undefined
+    contractAddress?: `0x${string}`
+  } | undefined>(initialPending?.kind === 'distribution'
+    ? { address: accountAddress, chainId, contractAddress: initialPending.contractAddress }
+    : undefined)
+  const [submissionLock, setSubmissionLock] = useState<'approval' | 'distribution' | null>(initialPending?.kind ?? null)
+  const currentContextKey = `${accountAddress?.toLowerCase() ?? ''}:${chainId ?? ''}:${network?.contractAddress?.toLowerCase() ?? ''}`
+  const previousContextKey = useRef(currentContextKey)
+
+  useEffect(() => {
+    if (previousContextKey.current === currentContextKey) return
+    previousContextKey.current = currentContextKey
+    let active = true
+    queueMicrotask(() => {
+      if (!active) return
+      const pending = getPendingTransaction(accountAddress, chainId, network?.contractAddress)
+      setSubmissionLock(pending?.kind ?? null)
+      setApprovalContext(pending?.kind === 'approval'
+        ? { address: accountAddress, chainId, contractAddress: pending.contractAddress }
+        : undefined)
+      setDistributionContext(pending?.kind === 'distribution'
+        ? { address: accountAddress, chainId, contractAddress: pending.contractAddress }
+        : undefined)
+      setApproveTxHash(pending?.kind === 'approval' ? pending.txHash : undefined)
+      setApproveTxChainId(pending?.kind === 'approval' ? chainId : undefined)
+      setDistributeTxHash(pending?.kind === 'distribution' ? pending.txHash : undefined)
+      setDistributeTxChainId(pending?.kind === 'distribution' ? chainId : undefined)
+      setTxPhase(pending?.kind === 'approval'
+        ? 'approving'
+        : pending?.kind === 'distribution'
+          ? 'distributing'
+          : 'idle')
+      setError(pending ? '' : 'Wallet account or network changed, or the ArcSplit contract target changed. Review and submit this split again.')
+    })
+    return () => { active = false }
+  }, [currentContextKey, accountAddress, chainId, network?.contractAddress])
 
   const isWrongChain = !network
-  const payouts = computePayouts(recipients, amountRaw)
-  const needsApproval = !network || allowance < amountRaw
+  const payouts = recipients.map((recipient) => recipient.amountRaw)
+  const fixedTotal = recipients.reduce((sum, recipient) => sum + recipient.amountRaw, 0n)
+  const distributionTotal = fixedTotal
+  const validRecipients = recipients.length > 0
+    && recipients.length <= 50
+    && recipients.every((recipient) => isValidAddress(recipient.address) && recipient.amountRaw > 0n)
+    && new Set(recipients.map((recipient) => recipient.address.toLowerCase())).size === recipients.length
+  const splitMatchesTotal = amountRaw > 0n && fixedTotal === amountRaw && validRecipients
+  const needsApproval = !network || allowance < distributionTotal
 
   // ── Approve ───────────────────────────────────────────────────────────────
-  const { writeContract: writeApprove, isPending: approvePending } = useWriteContract()
+  const { mutate: writeApprove, isPending: approvePending } = useWriteContract()
   const {
     data: approveReceipt,
     error: approveReceiptError,
@@ -71,7 +199,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
   })
 
   // ── Distribute ────────────────────────────────────────────────────────────
-  const { writeContract: writeDistribute, isPending: distributePending } = useWriteContract()
+  const { mutate: writeDistribute, isPending: distributePending } = useWriteContract()
   const {
     data: distributeReceipt,
     error: distributeReceiptError,
@@ -84,115 +212,326 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
     chainId: distributeTxChainId,
   })
 
+  const simulationEnabled = !!network?.contractAddress
+    && !!accountAddress
+    && splitMatchesTotal
+    && allowance >= distributionTotal
+    && !allowanceLoading
+    && !allowanceFetching
+    && !allowanceReadFailed
+    && !balanceLoading
+    && !balanceFetching
+    && !balanceReadFailed
+    && balance >= distributionTotal
+  const {
+    data: distributionSimulation,
+    error: distributionSimulationError,
+    isFetching: distributionSimulationFetching,
+  } = useSimulateContract({
+    address: network?.contractAddress,
+    abi: ARCSPLIT_FIXED_ABI,
+    functionName: 'distributeFixedAmounts',
+    args: [
+      recipients.map((recipient) => recipient.address as `0x${string}`),
+      recipients.map((recipient) => recipient.amountRaw),
+    ],
+    account: accountAddress,
+    chainId: network?.chainId,
+    query: { enabled: simulationEnabled, retry: false },
+  })
+
   // Derive the overall phase from transaction receipts where possible
   // to avoid calling setState inside effects
-  const isDone = distributeReceipt?.status === 'success' && txPhase === 'distributing'
-  const isApproved = (approveReceipt?.status === 'success' && txPhase === 'approving') || txPhase === 'approved'
+  const distributionContextMatches =
+    distributionContext?.address?.toLowerCase() === accountAddress?.toLowerCase()
+    && distributionContext?.chainId === chainId
+    && distributionContext?.contractAddress?.toLowerCase() === network?.contractAddress?.toLowerCase()
+  const approvalContextMatches =
+    approvalContext?.address?.toLowerCase() === accountAddress?.toLowerCase()
+    && approvalContext?.chainId === chainId
+    && approvalContext?.contractAddress?.toLowerCase() === network?.contractAddress?.toLowerCase()
+  const isDone = distributeReceipt?.status === 'success'
+    && txPhase === 'distributing'
+    && distributionContextMatches
   const approvalReceiptUnknown = approveReceiptFailed && txPhase === 'approving'
   const distributionReceiptUnknown = distributeReceiptFailed && txPhase === 'distributing'
-  const approvalReverted = approveReceipt?.status === 'reverted' && txPhase === 'approving'
-  const distributionReverted = distributeReceipt?.status === 'reverted' && txPhase === 'distributing'
   const receiptError = approvalReceiptUnknown
     ? receiptErrorMessage(approveReceiptError, 'approval')
     : distributionReceiptUnknown
       ? receiptErrorMessage(distributeReceiptError, 'distribution')
-      : approvalReverted
-        ? 'The approval transaction reverted. No approval was confirmed.'
-        : distributionReverted
-          ? 'The distribution transaction reverted. No payment was sent.'
-          : ''
+      : ''
+  const preflightMessage = allowanceReadFailed
+    ? `Could not read USDC allowance: ${detailedErrorMessage(allowanceReadError)}`
+    : balanceReadFailed
+      ? `Could not read USDC balance: ${detailedErrorMessage(balanceReadError)}`
+      : !splitMatchesTotal
+        ? 'Allocated amounts must match the total amount, with valid, unique recipients and positive amounts.'
+        : !balanceLoading && !balanceFetching && balance < distributionTotal
+          ? 'Insufficient USDC balance.'
+          : distributionSimulationError && simulationEnabled
+            ? `Distribution preflight failed: ${detailedErrorMessage(distributionSimulationError)}`
+            : ''
 
   const handleApprove = useCallback(() => {
+    if (submissionLock || txPhase !== 'idle') return
+    if (!accountAddress) {
+      setError('Connect a wallet before approving USDC.')
+      return
+    }
+    if (allowanceLoading || allowanceFetching || balanceLoading || balanceFetching
+      || allowanceReadFailed || balanceReadFailed) {
+      setError(preflightMessage || 'USDC allowance or balance could not be verified. No transaction was sent.')
+      return
+    }
+    if (!splitMatchesTotal) {
+      setError('Allocated amounts must match the total amount.')
+      return
+    }
     if (!network?.contractAddress) {
       setError('ArcSplit contract is not configured for this network.')
       return
     }
+    if (allowance >= distributionTotal) {
+      setError('The current on-chain allowance is already sufficient. No approval is needed.')
+      return
+    }
+    if (balance < distributionTotal) {
+      setError('Insufficient USDC balance.')
+      return
+    }
+    setSubmissionLock('approval')
+    setApprovalContext({
+      address: accountAddress,
+      chainId: network.chainId,
+      contractAddress: network.contractAddress,
+    })
     setError('')
     setTxPhase('approving')
     setApproveTxHash(undefined)
     setApproveTxChainId(network.chainId)
-    writeApprove(
-      {
-        address: network.usdcAddress,
-        abi: erc20Abi,
-        functionName: 'approve',
-        args: [network.contractAddress, amountRaw],
-        chainId: network.chainId,
-      },
-      {
-        onSuccess: (hash) => {
-          setApproveTxHash(hash)
-          setApproveTxChainId(network.chainId)
-          toast.info('Approval submitted…')
+    try {
+      writeApprove(
+        {
+          address: network.usdcAddress,
+          abi: erc20Abi,
+          functionName: 'approve',
+          args: [network.contractAddress, distributionTotal],
+          chainId: network.chainId,
         },
-        onError: (err) => {
-          const msg = parseContractError(err)
-          if (!msg.includes('cancelled')) {
+        {
+          onSuccess: (hash) => {
+            const record = {
+              kind: 'approval' as const,
+              txHash: hash,
+              amountRaw: distributionTotal.toString(),
+              contractAddress: network.contractAddress,
+              recipients: recipients.map((recipient) => ({
+                address: recipient.address,
+                amountRaw: recipient.amountRaw.toString(),
+              })),
+            }
+            if (!savePendingTransaction(accountAddress, network.chainId, record)) {
+              setError('Approval was submitted, but this browser could not save its recovery details.')
+            }
+            setApproveTxHash(hash)
+            setApproveTxChainId(network.chainId)
+            toast.info('Approval submitted…')
+          },
+          onError: (err) => {
+            clearPendingTransaction(accountAddress, network.chainId, network.contractAddress)
+            setSubmissionLock(null)
+            const msg = transactionErrorMessage(err)
             setError(msg)
             toast.error(msg)
-          }
-          setTxPhase('idle')
+            setTxPhase('idle')
+          },
         },
-      }
-    )
-  }, [writeApprove, amountRaw, network])
-
-  // When the user sees the approval has confirmed and clicks Distribute,
-  // we advance to 'approved' phase so the UI shows the distribute button
-  const handleAdvanceToDistribute = useCallback(() => {
-    void refetchAllowance()
-    setTxPhase('approved')
-    toast.success('USDC approved. Ready to distribute.')
-  }, [refetchAllowance])
+      )
+    } catch (err) {
+      setSubmissionLock(null)
+      setTxPhase('idle')
+      setError(transactionErrorMessage(err))
+    }
+  }, [
+    writeApprove, distributionTotal, network, accountAddress, splitMatchesTotal,
+    allowance, balance, recipients, txPhase, submissionLock, allowanceLoading, allowanceFetching,
+    balanceLoading, balanceFetching,
+    allowanceReadFailed, balanceReadFailed, preflightMessage,
+  ])
 
   const handleDistribute = useCallback(() => {
+    if (submissionLock || txPhase !== 'idle') return
     if (!network?.contractAddress) {
       setError('ArcSplit contract is not configured for this network.')
       return
     }
-    setError('')
-    setTxPhase('distributing')
-
-    if (balance < amountRaw) {
-      setError('Insufficient USDC balance.')
-      setTxPhase('approved')
+    if (!accountAddress) {
+      setError('Connect a wallet before distributing.')
       return
     }
-
+    if (allowanceLoading || allowanceFetching || balanceLoading || balanceFetching
+      || allowanceReadFailed || balanceReadFailed) {
+      setError(preflightMessage || 'USDC allowance or balance could not be verified. No transaction was sent.')
+      return
+    }
+    if (!splitMatchesTotal) {
+      setError('Allocated amounts must match the total amount.')
+      return
+    }
+    if (allowance < distributionTotal) {
+      setError('Insufficient USDC allowance. Approve USDC before distributing.')
+      return
+    }
+    if (balance < distributionTotal) {
+      setError('Insufficient USDC balance.')
+      return
+    }
+    if (!distributionSimulation?.request) {
+      setError(distributionSimulationError
+        ? `Distribution preflight failed: ${detailedErrorMessage(distributionSimulationError)}`
+        : 'Distribution preflight is not ready. No transaction was sent.')
+      return
+    }
+    setSubmissionLock('distribution')
+    setDistributionContext({
+      address: accountAddress,
+      chainId: network.chainId,
+      contractAddress: network.contractAddress,
+    })
+    setError('')
+    setTxPhase('distributing')
     setDistributeTxHash(undefined)
     setDistributeTxChainId(network.chainId)
-    writeDistribute(
-      {
-        address: network.contractAddress,
-        abi: ARCSPLIT_ABI,
-        functionName: 'distribute',
-        args: [
-          recipients.map((r) => r.address as `0x${string}`),
-          recipients.map((r) => BigInt(r.sharesBps)),
-          amountRaw,
-        ],
-        chainId: network.chainId,
-      },
-      {
+    try {
+      writeDistribute(distributionSimulation.request, {
         onSuccess: (hash) => {
+          const record = {
+            kind: 'distribution' as const,
+            txHash: hash,
+            amountRaw: distributionTotal.toString(),
+            contractAddress: network.contractAddress,
+            recipients: recipients.map((recipient) => ({
+              address: recipient.address,
+              amountRaw: recipient.amountRaw.toString(),
+            })),
+          }
+          if (!savePendingTransaction(accountAddress, network.chainId, record)) {
+            setError('Distribution was submitted, but this browser could not save its recovery details.')
+          }
           setDistributeTxHash(hash)
           setDistributeTxChainId(network.chainId)
           toast.info('Distribution submitted…')
         },
         onError: (err) => {
-          const msg = parseContractError(err)
-          if (!msg.includes('cancelled')) {
-            setError(msg)
-            toast.error(msg)
-          }
-          setTxPhase('approved')
+          clearPendingTransaction(accountAddress, network.chainId, network.contractAddress)
+          setSubmissionLock(null)
+          const msg = transactionErrorMessage(err)
+          setError(msg)
+          toast.error(msg)
+          setTxPhase('idle')
         },
-      }
-    )
-  }, [writeDistribute, recipients, amountRaw, balance, network])
+      })
+    } catch (err) {
+      setSubmissionLock(null)
+      setTxPhase('idle')
+      setError(transactionErrorMessage(err))
+    }
+  }, [
+    writeDistribute, recipients, balance, allowance, splitMatchesTotal,
+    distributionTotal, distributionSimulation, distributionSimulationError, submissionLock,
+    network, accountAddress, txPhase, allowanceLoading, allowanceFetching,
+    balanceLoading, balanceFetching,
+    allowanceReadFailed, balanceReadFailed, preflightMessage,
+  ])
 
   const isLoading = approvePending || approveConfirming || distributePending || distributeConfirming
-  const approveStepDone = !needsApproval || isApproved || txPhase === 'distributing'
+    || allowanceFetching || balanceFetching
+  const approveStepDone = !needsApproval || txPhase === 'distributing'
+  const handledApprovalReceipt = useRef<`0x${string}` | undefined>()
+  const handledDistributionReceipt = useRef<`0x${string}` | undefined>()
+
+  useEffect(() => {
+    if (!approveTxHash || !approvalContextMatches || !approveReceipt?.status
+      || handledApprovalReceipt.current === approveTxHash) return
+    handledApprovalReceipt.current = approveTxHash
+
+    if (approveReceipt.status === 'reverted') {
+      clearPendingTransaction(
+        accountAddress,
+        approveTxChainId,
+        approvalContext?.contractAddress,
+      )
+      queueMicrotask(() => {
+        setSubmissionLock(null)
+        setApproveTxHash(undefined)
+        setApproveTxChainId(undefined)
+        setTxPhase('idle')
+        setError('The approval transaction reverted. No approval was confirmed.')
+      })
+      return
+    }
+
+    const submittedContractAddress = approvalContext?.contractAddress
+    void refetchAllowance()
+      .then((result) => {
+        clearPendingTransaction(accountAddress, approveTxChainId, submittedContractAddress)
+        setSubmissionLock(null)
+        setApproveTxHash(undefined)
+        setApproveTxChainId(undefined)
+        setTxPhase('idle')
+        if (result.isError) {
+          setError(`Approval confirmed, but allowance refresh failed: ${detailedErrorMessage(result.error)}`)
+        } else {
+          setError('')
+          toast.success('USDC approved. Allowance refreshed.')
+        }
+      })
+      .catch((refreshError: unknown) => {
+        clearPendingTransaction(accountAddress, approveTxChainId, submittedContractAddress)
+        setSubmissionLock(null)
+        setApproveTxHash(undefined)
+        setApproveTxChainId(undefined)
+        setTxPhase('idle')
+        setError(`Approval confirmed, but allowance refresh failed: ${detailedErrorMessage(refreshError)}`)
+      })
+  }, [
+    approveTxHash, approveTxChainId, approveReceipt?.status, approvalContextMatches,
+    accountAddress, network?.contractAddress, approvalContext?.contractAddress, refetchAllowance,
+  ])
+
+  useEffect(() => {
+    if (!distributeTxHash || !distributionContextMatches || distributeReceipt?.status !== 'reverted'
+      || handledDistributionReceipt.current === distributeTxHash) return
+    handledDistributionReceipt.current = distributeTxHash
+    const submitted = distributionContext
+    if (submitted?.chainId) {
+      const saved = addHistoryEntry(submitted.address, submitted.chainId, {
+        txHash: distributeTxHash,
+        chainId: submitted.chainId,
+        status: 'failed',
+        ...(submitted.contractAddress ? { contractAddress: submitted.contractAddress } : {}),
+        mode: 'fixed',
+        totalRaw: distributionTotal.toString(),
+        recipients: recipients.map((recipient) => ({
+          address: recipient.address,
+          amountRaw: recipient.amountRaw.toString(),
+        })),
+      })
+      if (!saved) toast.error('The reverted distribution was confirmed, but its history could not be saved in this browser.')
+    }
+    clearPendingTransaction(accountAddress, distributeTxChainId, submitted?.contractAddress)
+    queueMicrotask(() => {
+      setSubmissionLock(null)
+      setDistributeTxHash(undefined)
+      setDistributeTxChainId(undefined)
+      setTxPhase('idle')
+      setError('The distribution transaction reverted. No payment was recorded as successful.')
+    })
+  }, [
+    distributeTxHash, distributeTxChainId, distributeReceipt?.status,
+    distributionContextMatches, distributionContext, accountAddress, distributionTotal, recipients,
+  ])
+
   const refreshedDistributionHash = useRef<`0x${string}` | undefined>()
 
   useEffect(() => {
@@ -200,6 +539,37 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
     refreshedDistributionHash.current = distributeTxHash
     void refetchBalance()
   }, [isDone, distributeTxHash, refetchBalance])
+
+  const recordedDistributionHash = useRef<`0x${string}` | undefined>()
+
+  useEffect(() => {
+    if (!isDone || !distributeTxHash || recordedDistributionHash.current === distributeTxHash) return
+    recordedDistributionHash.current = distributeTxHash
+    const submitted = distributionContext
+    if (!submitted?.chainId) return
+    const saved = addHistoryEntry(submitted.address, submitted.chainId, {
+      txHash: distributeTxHash,
+      chainId: submitted.chainId,
+      status: 'success',
+      ...(submitted.contractAddress ? { contractAddress: submitted.contractAddress } : {}),
+      mode: 'fixed',
+      totalRaw: distributionTotal.toString(),
+      recipients: recipients.map((recipient) => ({
+        address: recipient.address,
+        amountRaw: recipient.amountRaw.toString(),
+      })),
+    })
+    if (!saved) toast.error('Payment succeeded, but its history could not be saved in this browser.')
+    clearPendingTransaction(submitted.address, submitted.chainId, submitted.contractAddress)
+  }, [isDone, distributeTxHash, accountAddress, chainId, distributionTotal, distributionContext, recipients])
+
+  const notifiedDistributionHash = useRef<`0x${string}` | undefined>()
+
+  useEffect(() => {
+    if (!isDone || !distributeTxHash || notifiedDistributionHash.current === distributeTxHash) return
+    notifiedDistributionHash.current = distributeTxHash
+    onDistributionConfirmed?.()
+  }, [isDone, distributeTxHash, onDistributionConfirmed])
 
   useEffect(() => {
     if (!isDone || !distributeTxHash || soundedDistributionHashes.has(distributeTxHash)) return
@@ -332,7 +702,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
                   {shortAddress(r.address)}
                 </span>
                 <span className="text-xs tabular-nums" style={{ color: 'var(--subtle)' }}>
-                  {(r.sharesBps / 100).toFixed(2)}%
+                  Exact amount
                 </span>
               </div>
               <span className="text-sm font-semibold tabular-nums" style={{ color: 'var(--ink)' }}>
@@ -368,7 +738,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
               Approve USDC
             </p>
             <p className="text-xs" style={{ color: 'var(--muted)' }}>
-              Allow ArcSplit to spend {formatUsdc(amountRaw)} USDC
+              Allow ArcSplit to spend {formatUsdc(distributionTotal)} USDC
             </p>
           </div>
           {(approvePending || approveConfirming) && (
@@ -432,7 +802,7 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
       </div>
 
       {/* Error */}
-      {(error || receiptError) && (
+      {(error || receiptError || (txPhase === 'idle' && preflightMessage)) && (
         <div
           role="alert"
           className="flex items-start gap-2 rounded-xl px-3 py-2.5"
@@ -442,7 +812,9 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
           }}
         >
           <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" style={{ color: approvalReceiptUnknown || distributionReceiptUnknown ? 'var(--warning)' : 'var(--danger)' }} />
-          <span className="min-w-0 text-sm leading-relaxed" style={{ color: approvalReceiptUnknown || distributionReceiptUnknown ? 'var(--warning)' : 'var(--danger)' }}>{error || receiptError}</span>
+          <span className="min-w-0 text-sm leading-relaxed" style={{ color: approvalReceiptUnknown || distributionReceiptUnknown ? 'var(--warning)' : 'var(--danger)' }}>
+            {error || receiptError || preflightMessage}
+          </span>
         </div>
       )}
 
@@ -481,20 +853,30 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
               'Switch to Arc Mainnet'
             )}
           </button>
-        ) : txPhase === 'idle' || txPhase === 'approving' ? (
-          /* Show the approval CTA, or "advance to distribute" if approval just confirmed */
-          isApproved && txPhase === 'approving' ? (
-            <button
-              onClick={handleAdvanceToDistribute}
-              className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-slate-950 transition-all hover:brightness-110"
-              style={{ background: 'var(--success)' }}
-            >
-              <Check className="h-4 w-4" /> Approved — Continue
-            </button>
-          ) : (
+        ) : txPhase === 'approving' ? (
+          <button
+            disabled
+            className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white opacity-60"
+            style={{ background: 'var(--accent-gradient)' }}
+          >
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {approveConfirming ? 'Confirming approval…' : 'Approval pending…'}
+          </button>
+        ) : txPhase === 'distributing' ? (
+          <button
+            disabled
+            className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white opacity-60"
+            style={{ background: 'var(--accent-gradient)' }}
+          >
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {distributeConfirming ? 'Distributing…' : 'Distribution pending…'}
+          </button>
+        ) : needsApproval ? (
             <button
               onClick={handleApprove}
-              disabled={isLoading || (!needsApproval && txPhase === 'idle')}
+              disabled={isLoading || allowanceLoading || balanceLoading || allowanceReadFailed
+                || balanceReadFailed || !splitMatchesTotal || balance < distributionTotal
+                || submissionLock !== null}
               className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
               style={{ background: 'var(--accent-gradient)' }}
             >
@@ -506,25 +888,19 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" /> Confirming…
                 </>
-              ) : approvalReverted ? (
-                <>
-                  Retry Approval <ArrowRight className="h-4 w-4" />
-                </>
-              ) : !needsApproval ? (
-                <>
-                  <Check className="h-4 w-4" /> Already Approved — Distribute
-                </>
               ) : (
                 <>
                   Approve USDC <ArrowRight className="h-4 w-4" />
                 </>
               )}
             </button>
-          )
         ) : (
           <button
             onClick={handleDistribute}
-            disabled={isLoading}
+            disabled={isLoading || allowanceLoading || balanceLoading || allowanceReadFailed
+              || balanceReadFailed || !splitMatchesTotal || balance < distributionTotal
+              || !distributionSimulation?.request || distributionSimulationFetching
+              || submissionLock !== null}
             className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             style={{ background: 'var(--accent-gradient)' }}
           >
@@ -536,9 +912,13 @@ export function ReviewStep({ amountRaw, recipients, onBack, onReset }: Props) {
               <>
                 <Loader2 className="h-4 w-4 animate-spin" /> Distributing…
               </>
+            ) : allowanceLoading || balanceLoading || distributionSimulationFetching ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" /> Checking transaction…
+              </>
             ) : (
               <>
-                {distributionReverted ? 'Retry Distribution' : 'Distribute Now'} <ArrowRight className="h-4 w-4" />
+                Distribute Now <ArrowRight className="h-4 w-4" />
               </>
             )}
           </button>

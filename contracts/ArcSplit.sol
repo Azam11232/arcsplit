@@ -20,6 +20,7 @@ contract ArcSplit is ReentrancyGuard {
     error ArrayLengthMismatch();
     error TooManyRecipients();
     error ZeroAddress();
+    error InvalidRecipient();
     error DuplicateRecipient();
     error ZeroShare();
     error InvalidSharesTotal();
@@ -40,11 +41,10 @@ contract ArcSplit is ReentrancyGuard {
     /// @param recipients Recipient addresses to receive payouts.
     /// @param sharesBps Share weights in basis points (must sum to 10_000).
     /// @param totalAmount Total USDC amount to split.
-    function distribute(
-        address[] calldata recipients,
-        uint256[] calldata sharesBps,
-        uint256 totalAmount
-    ) external nonReentrant {
+    function distribute(address[] calldata recipients, uint256[] calldata sharesBps, uint256 totalAmount)
+        external
+        nonReentrant
+    {
         if (totalAmount == 0) revert ZeroAmount();
 
         uint256 recipientCount = recipients.length;
@@ -56,6 +56,7 @@ contract ArcSplit is ReentrancyGuard {
         for (uint256 i = 0; i < recipientCount; ++i) {
             address recipient = recipients[i];
             if (recipient == address(0)) revert ZeroAddress();
+            if (recipient == address(this)) revert InvalidRecipient();
 
             uint256 share = sharesBps[i];
             if (share == 0) revert ZeroShare();
@@ -83,6 +84,43 @@ contract ArcSplit is ReentrancyGuard {
 
             USDC.safeTransfer(recipients[i], amount);
             emit RecipientPayout(recipients[i], amount);
+        }
+
+        emit Distributed(msg.sender, totalAmount, recipientCount);
+    }
+
+    /// @notice Distributes a USDC payment using one exact amount per recipient.
+    /// @dev Pulls the sum of `amounts` from the payer via transferFrom, then pays
+    ///      each recipient the corresponding amount. The whole call reverts if
+    ///      validation or any recipient transfer fails.
+    /// @param recipients Recipient addresses to receive payouts.
+    /// @param amounts Exact USDC amounts in the token's smallest unit.
+    function distributeFixedAmounts(address[] calldata recipients, uint256[] calldata amounts) external nonReentrant {
+        uint256 recipientCount = recipients.length;
+        if (recipientCount == 0 || recipientCount != amounts.length) revert ArrayLengthMismatch();
+        if (recipientCount > MAX_RECIPIENTS) revert TooManyRecipients();
+
+        uint256 totalAmount = 0;
+
+        for (uint256 i = 0; i < recipientCount; ++i) {
+            address recipient = recipients[i];
+            if (recipient == address(0)) revert ZeroAddress();
+            if (recipient == address(this)) revert InvalidRecipient();
+
+            uint256 amount = amounts[i];
+            if (amount == 0) revert ZeroAmount();
+            totalAmount += amount;
+
+            for (uint256 j = i + 1; j < recipientCount; ++j) {
+                if (recipient == recipients[j]) revert DuplicateRecipient();
+            }
+        }
+
+        USDC.safeTransferFrom(msg.sender, address(this), totalAmount);
+
+        for (uint256 i = 0; i < recipientCount; ++i) {
+            USDC.safeTransfer(recipients[i], amounts[i]);
+            emit RecipientPayout(recipients[i], amounts[i]);
         }
 
         emit Distributed(msg.sender, totalAmount, recipientCount);

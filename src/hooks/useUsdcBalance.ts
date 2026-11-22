@@ -10,13 +10,18 @@ export function useUsdcBalance() {
   const { address, chainId } = useAccount()
   const network = getArcNetwork(chainId)
 
-  const { data: rawBalance, isLoading, refetch } = useReadContract({
+  const { data: rawBalance, error, isError, isLoading, isFetching, refetch } = useReadContract({
     address: network?.usdcAddress,
     abi: erc20Abi,
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
     chainId: network?.chainId ?? ARC_MAINNET_CHAIN_ID,
-    query: { enabled: !!address && !!network },
+    query: {
+      enabled: !!address && !!network,
+      refetchOnMount: 'always',
+      refetchOnWindowFocus: true,
+      staleTime: 0,
+    },
   })
 
   const raw = (rawBalance) ?? 0n
@@ -27,6 +32,9 @@ export function useUsdcBalance() {
     decimals,
     formatted: formatUsdcBalance(raw),
     isLoading,
+    isFetching,
+    isError,
+    error,
     refetch,
   }
 }
