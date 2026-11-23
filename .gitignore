@@ -36,3 +36,5 @@ Thumbs.db
 .idea/
 # Vite build output
 dist/
+
+broadcast/

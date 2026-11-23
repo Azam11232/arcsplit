@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useAccount, useSwitchChain } from 'wagmi'
 import { ConnectKitButton } from 'connectkit'
 import { TokenUSDC } from '@web3icons/react'
@@ -10,35 +10,36 @@ import {
   parseUsdc,
   formatUsdc,
   getArcNetwork,
+  getUsdcInputError,
+  isProductionArcEnvironment,
 } from '@/utils/arcsplit'
 
 interface Props {
+  initialAmountRaw: bigint
   onNext: (amountRaw: bigint) => void
 }
 
-export function AmountStep({ onNext }: Props) {
+export function AmountStep({ initialAmountRaw, onNext }: Props) {
   const { address, chainId, isConnected } = useAccount()
   const { switchChain } = useSwitchChain()
   const network = getArcNetwork(chainId)
   const { raw: balanceRaw, formatted: balanceFormatted, isLoading: balanceLoading } = useUsdcBalance()
 
-  const [input, setInput] = useState('')
+  const [input, setInput] = useState(() => initialAmountRaw > 0n ? formatUsdc(initialAmountRaw) : '')
   const [error, setError] = useState('')
 
+  useEffect(() => {
+    setInput(initialAmountRaw > 0n ? formatUsdc(initialAmountRaw) : '')
+  }, [initialAmountRaw])
+
   const isWrongChain = isConnected && !network
-  const isTestnet = isConnected && network?.chainId === ARC_TESTNET_CHAIN_ID
+  const isTestnet = isConnected && chainId === ARC_TESTNET_CHAIN_ID
+  const isProductionTestnet = isProductionArcEnvironment() && isTestnet
   const isDeployed = !!network?.contractAddress
 
   const handleInput = useCallback((val: string) => {
-    const clean = val.replace(/[^0-9.]/g, '')
-    if (/^\d*\.?\d*$/.test(clean) && clean.split('.')[1]?.length > 6) {
-      setError('USDC amounts support up to 6 decimal places.')
-      return
-    }
-    if (clean === '' || /^\d*\.?\d{0,6}$/.test(clean)) {
-      setInput(clean)
-      setError('')
-    }
+    setInput(val)
+    setError(getUsdcInputError(val) ?? '')
   }, [])
 
   const handleMax = useCallback(() => {
@@ -49,8 +50,17 @@ export function AmountStep({ onNext }: Props) {
   }, [balanceRaw])
 
   const handleContinue = useCallback(() => {
-    if (!input || input === '0' || input === '0.00') {
+    if (isProductionTestnet) {
+      setError('Arc Testnet is not available in production. Switch to Arc Mainnet.')
+      return
+    }
+    if (!input || input === '0' || input === '0.00' || input === '.') {
       setError('Enter an amount greater than zero.')
+      return
+    }
+    const inputError = getUsdcInputError(input)
+    if (inputError) {
+      setError(inputError)
       return
     }
     let raw: bigint
@@ -119,6 +129,7 @@ export function AmountStep({ onNext }: Props) {
         </label>
         <div className="flex items-center gap-2">
           <input
+            type="text"
             inputMode="decimal"
             value={input}
             onChange={(e) => handleInput(e.target.value)}
@@ -170,7 +181,9 @@ export function AmountStep({ onNext }: Props) {
       {isTestnet && (
         <div className="flex items-center justify-between gap-3 rounded-xl px-3 py-2.5" style={{ background: 'var(--info-surface)', border: '1px solid var(--border)' }}>
           <p className="text-xs" style={{ color: 'var(--muted)' }}>
-            Arc Testnet is for testing. Switch to Arc Mainnet for production payments.
+            {isProductionTestnet
+              ? 'Arc Testnet is not available in production. Switch to Arc Mainnet.'
+              : 'Arc Testnet is for local development and testing.'}
           </p>
           <button
             onClick={() => switchChain({ chainId: ARC_MAINNET_CHAIN_ID })}
@@ -214,7 +227,7 @@ export function AmountStep({ onNext }: Props) {
       ) : (
         <button
           onClick={handleContinue}
-          disabled={!input || !isDeployed}
+          disabled={!input || !isDeployed || !!error}
           className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
           style={{ background: 'var(--accent-gradient)', boxShadow: '0 8px 22px rgba(103,94,232,0.2)' }}
         >
