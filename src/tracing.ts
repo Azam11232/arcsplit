@@ -4,11 +4,19 @@
  * Patches globalThis.fetch to capture all viem http() transport RPC calls
  * and regular HTTP requests, and patches window.ethereum.request() to capture
  * EIP-1193 provider calls (e.g. eth_sendTransaction via injected wallets).
- * Events are sent to the parent frame via postMessage.
+ * Development-only events are sent to a same-origin parent frame via postMessage.
  *
  * Imported as a side-effect before any app code runs.
  * Built with Arc Studio — https://studio.arc.io
  */
+
+import {
+  getTrustedParentOrigin,
+  isTrustedParentMessage,
+  REDACTED_VALUE,
+  redactRpcMetadata,
+  redactTelemetryText,
+} from './utils/telemetrySecurity'
 
 // ---------------------------------------------------------------------------
 // Types (inlined — sandbox can't use app module aliases)
@@ -68,7 +76,7 @@ type TraceEvent = RpcTraceEvent | HttpTraceEvent | GroupStartTraceEvent | GroupE
 const LOG = '[studio-trace]';
 
 function log(...args: unknown[]): void {
-  console.log(LOG, ...args);
+  if (import.meta.env.DEV) console.log(LOG, ...args);
 }
 
 const MAX_BODY = 10_000;
@@ -132,7 +140,7 @@ function setupTraceAPI(): void {
   (window as unknown as { __studioTrace: StudioTraceAPI }).__studioTrace = api;
 }
 
-setupTraceAPI();
+if (import.meta.env.DEV) setupTraceAPI();
 
 // ---------------------------------------------------------------------------
 // emitWithGroups — attaches current group ancestry to RPC/HTTP events
@@ -143,30 +151,56 @@ function emitWithGroups(event: RpcTraceEvent | HttpTraceEvent): void {
   emit(groups.length > 0 ? { ...event, groups } : event);
 }
 
-/**
- * Resolve the parent frame's origin for targeted postMessage.
- * Falls back to '*' only if the origin cannot be determined.
- */
-const _parentOrigin: string = (() => {
-  try {
-    // ancestorOrigins is available in Chromium and Safari
-    if (window.location.ancestorOrigins?.length) {
-      return window.location.ancestorOrigins[0];
-    }
-  } catch { /* sandboxed iframe may throw */ }
-
-  try {
-    if (document.referrer) {
-      return new URL(document.referrer).origin;
-    }
-  } catch { /* malformed referrer */ }
-
-  return '*';
-})();
-
 function emit(event: TraceEvent): void {
+  const targetOrigin = getTrustedParentOrigin(
+    window.location.origin,
+    import.meta.env.DEV,
+    window.parent !== window,
+  )
+  if (!_enabled || targetOrigin === undefined) return;
+
+  const groups = event.groups?.map((group) => ({
+    ...group,
+    label: redactTelemetryText(group.label),
+  }))
+  let safeEvent: TraceEvent
+
+  if (event.kind === 'rpc') {
+    const metadata = redactRpcMetadata(event.params, event.result)
+    safeEvent = {
+      ...event,
+      method: redactTelemetryText(event.method),
+      ...metadata,
+      ...(event.error === undefined ? {} : { error: redactTelemetryText(event.error) }),
+      ...(groups === undefined ? {} : { groups }),
+    }
+  } else if (event.kind === 'http') {
+    safeEvent = {
+      ...event,
+      method: redactTelemetryText(event.method),
+      url: REDACTED_VALUE,
+      ...(event.requestBody === undefined ? {} : { requestBody: REDACTED_VALUE }),
+      ...(event.responseBody === undefined ? {} : { responseBody: REDACTED_VALUE }),
+      ...(groups === undefined ? {} : { groups }),
+    }
+  } else if (event.kind === 'group-start') {
+    safeEvent = {
+      ...event,
+      label: redactTelemetryText(event.label),
+      ...(groups === undefined ? {} : { groups }),
+    }
+  } else {
+    safeEvent = {
+      ...event,
+      ...(groups === undefined ? {} : { groups }),
+    }
+  }
+
   try {
-    window.parent.postMessage({ type: 'studio-trace-event', event }, _parentOrigin);
+    window.parent.postMessage(
+      { type: 'studio-trace-event', event: safeEvent },
+      targetOrigin,
+    );
   } catch {
     /* ignore */
   }
@@ -215,16 +249,22 @@ function parseChainId(raw: unknown): number {
 
 let _enabled = false;
 
-window.addEventListener('message', (e: MessageEvent<MessageData>) => {
-  if (e.source !== window.parent) {
-    return;
-  }
+if (import.meta.env.DEV) {
+  window.addEventListener('message', (e: MessageEvent<MessageData>) => {
+    if (!isTrustedParentMessage(
+      e.source,
+      e.origin,
+      window.parent,
+      window.location.origin,
+      import.meta.env.DEV,
+      window.parent !== window,
+    )) return;
+    if (e.data?.type !== 'studio-trace-config' || typeof e.data.enabled !== 'boolean') return;
 
-  if (e.data?.type === 'studio-trace-config') {
-    _enabled = !!e.data.enabled;
+    _enabled = e.data.enabled;
     log('tracing', _enabled ? 'enabled' : 'disabled');
-  }
-});
+  });
+}
 
 const NOISE = ['/_vite/', '/@vite/', '/@id/', '/node_modules/.vite/', 'chrome-extension://', 'localhost:5173'];
 
@@ -248,9 +288,8 @@ function host(url: string): string {
 
 /**
  * Resolve a fetch target to an absolute URL against the running app's origin.
- * Same-origin fetches pass a relative path (e.g. '/api/estimate'); capturing it
- * absolute here means the trace panel shows the real sandbox host instead of a
- * placeholder, and host()/chainForUrl() can key off it reliably.
+ * Same-origin fetches pass a relative path (e.g. '/api/estimate'); resolving it
+ * here lets host()/chainForUrl() key off the actual RPC host.
  */
 function toAbsoluteUrl(raw: string): string {
   try {
@@ -269,13 +308,13 @@ function learnChain(url: string, chainId: number): void {
   const h = host(url);
   if (h && chainId > 0) {
     _chainByHost.set(h, chainId);
-    log('chain learned:', h, '→', chainId);
+    log('chain learned:', chainId);
   }
 }
 
 /** Pre-register a chain's RPC URL so events show the correct chain from the start. */
 export function registerChain(chainId: number, rpcUrl: string): void {
-  learnChain(rpcUrl, chainId);
+  if (import.meta.env.DEV) learnChain(rpcUrl, chainId);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,75 +382,77 @@ function findResp(resps: JRPCRes[], reqId: unknown): JRPCRes | undefined {
 // Patch globalThis.fetch — captures viem http() transport + regular HTTP
 // ---------------------------------------------------------------------------
 
-try {
-  const _fetch = globalThis.fetch;
-  log('patching fetch');
+if (import.meta.env.DEV) {
+  try {
+    const _fetch = globalThis.fetch;
+    log('patching fetch');
 
-  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const ts = Date.now();
-    let method = 'GET';
-    let url = '';
-    let reqBody: unknown;
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const ts = Date.now();
+      let method = 'GET';
+      let url = '';
+      let reqBody: unknown;
 
-    try {
-      const rawUrl = input instanceof Request ? input.url : String(input);
-      url = toAbsoluteUrl(rawUrl);
-      method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-      // Noise-match the raw target, not the absolutized URL: the dev preview host
-      // (<id>.preview.localhost:5173) contains the "localhost:5173" NOISE substring,
-      // so matching the absolute URL would drop every same-origin request in dev.
-      if (!_enabled || isNoise(rawUrl)) return _fetch.call(globalThis, input, init);
-      if (init?.body) reqBody = tryJson(truncate(typeof init.body === 'string' ? init.body : stringify(init.body)));
-    } catch {
-      return _fetch.call(globalThis, input, init);
-    }
+      try {
+        const rawUrl = input instanceof Request ? input.url : String(input);
+        url = toAbsoluteUrl(rawUrl);
+        method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+        // Noise-match the raw target, not the absolutized URL: the dev preview host
+        // (<id>.preview.localhost:5173) contains the "localhost:5173" NOISE substring,
+        // so matching the absolute URL would drop every same-origin request in dev.
+        if (!_enabled || isNoise(rawUrl)) return _fetch.call(globalThis, input, init);
+        if (init?.body) reqBody = tryJson(truncate(typeof init.body === 'string' ? init.body : stringify(init.body)));
+      } catch {
+        return _fetch.call(globalThis, input, init);
+      }
 
-    let res: Response;
-    try {
-      res = await _fetch.call(globalThis, input, init);
-    } catch (err) {
+      let res: Response;
+      try {
+        res = await _fetch.call(globalThis, input, init);
+      } catch (err) {
+        const dur = Date.now() - ts;
+        try {
+          if (method === 'POST' && hasRpc(reqBody)) {
+            for (const r of toReqs(reqBody)) {
+              emitWithGroups({ kind: 'rpc', id: id(), timestamp: ts, method: r.method, params: r.params ?? [], chainId: chainForUrl(url), error: err instanceof Error ? err.message : String(err), duration: dur });
+            }
+          } else {
+            emitWithGroups({ kind: 'http', id: id(), timestamp: ts, method, url, status: 0, duration: dur, requestBody: reqBody });
+          }
+        } catch { /* swallow */ }
+        throw err;
+      }
+
       const dur = Date.now() - ts;
+      let resBody: unknown;
+      try { resBody = tryJson(truncate(await res.clone().text())); } catch { /* ignore */ }
+
       try {
         if (method === 'POST' && hasRpc(reqBody)) {
-          for (const r of toReqs(reqBody)) {
-            emitWithGroups({ kind: 'rpc', id: id(), timestamp: ts, method: r.method, params: r.params ?? [], chainId: chainForUrl(url), error: err instanceof Error ? err.message : String(err), duration: dur });
+          const reqs = toReqs(reqBody);
+          const resps = toResps(resBody);
+          for (const r of reqs) {
+            const resp = findResp(resps, r.id) ?? resps[0];
+            const result = resp?.result;
+            const error = resp?.error?.message;
+            // Learn chainId from eth_chainId responses
+            if (r.method === 'eth_chainId' && result) learnChain(url, parseChainId(result));
+            // Also learn from responses that embed chainId (e.g. eth_getTransactionByHash)
+            if (result && typeof result === 'object' && 'chainId' in (result as Record<string, unknown>)) {
+              const embedded = parseChainId((result as Record<string, unknown>).chainId);
+              if (embedded > 0) learnChain(url, embedded);
+            }
+            emitWithGroups({ kind: 'rpc', id: id(), timestamp: ts, method: r.method, params: r.params ?? [], chainId: chainForUrl(url), result, error, duration: dur });
           }
         } else {
-          emitWithGroups({ kind: 'http', id: id(), timestamp: ts, method, url, status: 0, duration: dur, requestBody: reqBody });
+          emitWithGroups({ kind: 'http', id: id(), timestamp: ts, method, url, status: res.status, duration: dur, requestBody: reqBody, responseBody: resBody });
         }
       } catch { /* swallow */ }
-      throw err;
-    }
 
-    const dur = Date.now() - ts;
-    let resBody: unknown;
-    try { resBody = tryJson(truncate(await res.clone().text())); } catch { /* ignore */ }
-
-    try {
-      if (method === 'POST' && hasRpc(reqBody)) {
-        const reqs = toReqs(reqBody);
-        const resps = toResps(resBody);
-        for (const r of reqs) {
-          const resp = findResp(resps, r.id) ?? resps[0];
-          const result = resp?.result;
-          const error = resp?.error?.message;
-          // Learn chainId from eth_chainId responses
-          if (r.method === 'eth_chainId' && result) learnChain(url, parseChainId(result));
-          // Also learn from responses that embed chainId (e.g. eth_getTransactionByHash)
-          if (result && typeof result === 'object' && 'chainId' in (result as Record<string, unknown>)) {
-            const embedded = parseChainId((result as Record<string, unknown>).chainId);
-            if (embedded > 0) learnChain(url, embedded);
-          }
-          emitWithGroups({ kind: 'rpc', id: id(), timestamp: ts, method: r.method, params: r.params ?? [], chainId: chainForUrl(url), result, error, duration: dur });
-        }
-      } else {
-        emitWithGroups({ kind: 'http', id: id(), timestamp: ts, method, url, status: res.status, duration: dur, requestBody: reqBody, responseBody: resBody });
-      }
-    } catch { /* swallow */ }
-
-    return res;
-  };
-} catch (e) { log('fetch patch FAILED', e); }
+      return res;
+    };
+  } catch (e) { log('fetch patch FAILED', e); }
+}
 
 // ---------------------------------------------------------------------------
 // Patch window.ethereum.request() — captures EIP-1193 provider calls
@@ -473,29 +514,31 @@ function patchProvider(provider: EIP1193Provider | undefined): void {
   } catch { /* not all providers support .on() */ }
 }
 
-try {
-  // Case 1: provider already exists
-  const existingProvider = getEthereum();
-  if (existingProvider) {
-    patchProvider(existingProvider);
-  }
+if (import.meta.env.DEV) {
+  try {
+    // Case 1: provider already exists
+    const existingProvider = getEthereum();
+    if (existingProvider) {
+      patchProvider(existingProvider);
+    }
 
-  // Case 2: provider set later (wallet extensions inject asynchronously)
-  let _eth: EIP1193Provider | undefined = existingProvider;
-  Object.defineProperty(window, 'ethereum', {
-    configurable: true,
-    enumerable: true,
-    get() { return _eth; },
-    set(v: EIP1193Provider | undefined) {
-      _eth = v;
-      patchProvider(v);
-    },
-  });
+    // Case 2: provider set later (wallet extensions inject asynchronously)
+    let _eth: EIP1193Provider | undefined = existingProvider;
+    Object.defineProperty(window, 'ethereum', {
+      configurable: true,
+      enumerable: true,
+      get() { return _eth; },
+      set(v: EIP1193Provider | undefined) {
+        _eth = v;
+        patchProvider(v);
+      },
+    });
 
-  // Case 3: EIP-6963 multi-provider discovery
-  window.addEventListener('eip6963:announceProvider', ((e: EIP6963AnnounceProviderEvent) => {
-    patchProvider(e?.detail?.provider);
-  }));
-} catch (e) { log('EIP-1193 patch FAILED', e); }
+    // Case 3: EIP-6963 multi-provider discovery
+    window.addEventListener('eip6963:announceProvider', ((e: EIP6963AnnounceProviderEvent) => {
+      patchProvider(e?.detail?.provider);
+    }));
+  } catch (e) { log('EIP-1193 patch FAILED', e); }
+}
 
 log('initialized');

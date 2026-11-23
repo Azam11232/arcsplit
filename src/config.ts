@@ -34,8 +34,14 @@ export const arcMainnet = defineChain({
 registerChain(arcTestnet.id, arcTestnet.rpcUrls.default.http[0])
 registerChain(arcMainnet.id, 'https://rpc.mainnet.arc.io')
 
+export function getSupportedArcChains(
+  isProduction = import.meta.env.PROD,
+): readonly [typeof arcMainnet] | readonly [typeof arcMainnet, typeof arcTestnet] {
+  return isProduction ? [arcMainnet] : [arcMainnet, arcTestnet]
+}
+
 export const config = createConfig({
-  chains: [arcMainnet, arcTestnet],
+  chains: getSupportedArcChains(),
   connectors: [injected()],
   transports: {
     [arcMainnet.id]: http('https://rpc.mainnet.arc.io'),

@@ -592,6 +592,217 @@ contract ArcSplitTest is Test {
         assertEq(total, amount, "total distributed == totalAmount");
         assertEq(token.balanceOf(address(splitter)), 0, "splitter holds 0");
     }
+
+    // -----------------------------------------------------------------------
+    // Fixed-amount happy path and validation
+    // -----------------------------------------------------------------------
+    function test_DistributeFixedAmounts_ExactPayouts() public {
+        uint256 aliceAmount = 125e6;
+        uint256 bobAmount = 75e6;
+        uint256 totalAmount = aliceAmount + bobAmount;
+        _approve(payer, totalAmount);
+
+        address[] memory recipients = new address[](2);
+        recipients[0] = alice;
+        recipients[1] = bob;
+
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = aliceAmount;
+        amounts[1] = bobAmount;
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256 bobBefore = token.balanceOf(bob);
+
+        vm.prank(payer);
+        splitter.distributeFixedAmounts(recipients, amounts);
+
+        assertEq(token.balanceOf(alice) - aliceBefore, aliceAmount, "alice exact amount");
+        assertEq(token.balanceOf(bob) - bobBefore, bobAmount, "bob exact amount");
+        assertEq(token.balanceOf(address(splitter)), 0, "splitter holds no residual");
+    }
+
+    function test_DistributeFixedAmounts_Events() public {
+        uint256 aliceAmount = 30e6;
+        uint256 bobAmount = 70e6;
+        uint256 totalAmount = 100e6;
+        _approve(payer, totalAmount);
+
+        address[] memory recipients = new address[](2);
+        recipients[0] = alice;
+        recipients[1] = bob;
+
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = aliceAmount;
+        amounts[1] = bobAmount;
+
+        vm.expectEmit(true, false, false, true, address(splitter));
+        emit ArcSplit.RecipientPayout(alice, aliceAmount);
+        vm.expectEmit(true, false, false, true, address(splitter));
+        emit ArcSplit.RecipientPayout(bob, bobAmount);
+        vm.expectEmit(true, false, false, true, address(splitter));
+        emit ArcSplit.Distributed(payer, totalAmount, 2);
+
+        vm.prank(payer);
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertFixedAmounts_ArrayLengthMismatch() public {
+        address[] memory recipients = new address[](2);
+        recipients[0] = alice;
+        recipients[1] = bob;
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 100e6;
+
+        vm.prank(payer);
+        vm.expectRevert(ArcSplit.ArrayLengthMismatch.selector);
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertFixedAmounts_EmptyRecipients() public {
+        address[] memory recipients = new address[](0);
+        uint256[] memory amounts = new uint256[](0);
+
+        vm.prank(payer);
+        vm.expectRevert(ArcSplit.ArrayLengthMismatch.selector);
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertFixedAmounts_TooManyRecipients() public {
+        address[] memory recipients = new address[](51);
+        uint256[] memory amounts = new uint256[](51);
+
+        vm.prank(payer);
+        vm.expectRevert(ArcSplit.TooManyRecipients.selector);
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertFixedAmounts_ZeroAddress() public {
+        address[] memory recipients = new address[](1);
+        recipients[0] = address(0);
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 100e6;
+
+        vm.prank(payer);
+        vm.expectRevert(ArcSplit.ZeroAddress.selector);
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertFixedAmounts_ContractCannotBeRecipient() public {
+        address[] memory recipients = new address[](1);
+        recipients[0] = address(splitter);
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 100e6;
+
+        vm.prank(payer);
+        vm.expectRevert(ArcSplit.InvalidRecipient.selector);
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertPercentage_ContractCannotBeRecipient() public {
+        address[] memory recipients = new address[](1);
+        recipients[0] = address(splitter);
+        uint256[] memory shares = new uint256[](1);
+        shares[0] = 10_000;
+
+        vm.prank(payer);
+        vm.expectRevert(ArcSplit.InvalidRecipient.selector);
+        splitter.distribute(recipients, shares, 100e6);
+    }
+
+    function test_RevertFixedAmounts_DuplicateRecipient() public {
+        address[] memory recipients = new address[](2);
+        recipients[0] = alice;
+        recipients[1] = alice;
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = 50e6;
+        amounts[1] = 50e6;
+
+        vm.prank(payer);
+        vm.expectRevert(ArcSplit.DuplicateRecipient.selector);
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertFixedAmounts_ZeroAmount() public {
+        address[] memory recipients = new address[](1);
+        recipients[0] = alice;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 0;
+
+        vm.prank(payer);
+        vm.expectRevert(ArcSplit.ZeroAmount.selector);
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertFixedAmounts_InsufficientAllowance() public {
+        address[] memory recipients = new address[](1);
+        recipients[0] = alice;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 100e6;
+
+        vm.prank(payer);
+        vm.expectRevert();
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function test_RevertFixedAmounts_InsufficientBalance() public {
+        address poorPayer = makeAddr("fixedPoorPayer");
+        vm.prank(poorPayer);
+        token.approve(address(splitter), 100e6);
+
+        address[] memory recipients = new address[](1);
+        recipients[0] = alice;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 100e6;
+
+        vm.prank(poorPayer);
+        vm.expectRevert();
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
+
+    function testFuzz_DistributeFixedAmounts_SumAndExactPayouts(
+        uint256 aliceAmount,
+        uint256 bobAmount
+    ) public {
+        aliceAmount = bound(aliceAmount, 1, 500_000e6);
+        bobAmount = bound(bobAmount, 1, 500_000e6);
+        uint256 totalAmount = aliceAmount + bobAmount;
+
+        token.mint(payer, totalAmount);
+        _approve(payer, totalAmount);
+
+        address[] memory recipients = new address[](2);
+        recipients[0] = alice;
+        recipients[1] = bob;
+
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = aliceAmount;
+        amounts[1] = bobAmount;
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256 bobBefore = token.balanceOf(bob);
+
+        vm.prank(payer);
+        splitter.distributeFixedAmounts(recipients, amounts);
+
+        assertEq(token.balanceOf(alice) - aliceBefore, aliceAmount);
+        assertEq(token.balanceOf(bob) - bobBefore, bobAmount);
+        assertEq(token.balanceOf(address(splitter)), 0);
+    }
+
+    function test_RevertFixedAmounts_TotalOverflow() public {
+        address[] memory recipients = new address[](2);
+        recipients[0] = alice;
+        recipients[1] = bob;
+
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = type(uint256).max;
+        amounts[1] = 1;
+
+        vm.prank(payer);
+        vm.expectRevert();
+        splitter.distributeFixedAmounts(recipients, amounts);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 import { useAccount, useReadContract } from 'wagmi'
 import { erc20Abi } from 'viem'
-import { ARC_MAINNET_CHAIN_ID, formatUsdcBalance, getArcNetwork } from '@/utils/arcsplit'
+import { ARC_MAINNET_CHAIN_ID, formatUsdcBalance, getArcNetwork, isProductionArcEnvironment } from '@/utils/arcsplit'
 
 /**
  * Reads the connected Arc chain's ERC-20 USDC balance in 6-decimal units.
@@ -9,14 +9,22 @@ import { ARC_MAINNET_CHAIN_ID, formatUsdcBalance, getArcNetwork } from '@/utils/
 export function useUsdcBalance() {
   const { address, chainId } = useAccount()
   const network = getArcNetwork(chainId)
+  const productionTestnetBlocked = isProductionArcEnvironment()
+    && chainId !== undefined
+    && chainId !== ARC_MAINNET_CHAIN_ID
 
-  const { data: rawBalance, isLoading, refetch } = useReadContract({
+  const { data: rawBalance, error, isError, isLoading, isFetching, refetch } = useReadContract({
     address: network?.usdcAddress,
     abi: erc20Abi,
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
     chainId: network?.chainId ?? ARC_MAINNET_CHAIN_ID,
-    query: { enabled: !!address && !!network },
+    query: {
+      enabled: !!address && !!network && !productionTestnetBlocked,
+      refetchOnMount: 'always',
+      refetchOnWindowFocus: true,
+      staleTime: 0,
+    },
   })
 
   const raw = (rawBalance) ?? 0n
@@ -27,6 +35,9 @@ export function useUsdcBalance() {
     decimals,
     formatted: formatUsdcBalance(raw),
     isLoading,
+    isFetching,
+    isError,
+    error,
     refetch,
   }
 }

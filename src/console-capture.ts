@@ -2,8 +2,9 @@
  * Console & Error Capture Instrumentation
  *
  * Patches console.{log,info,warn,error,debug} and listens for window 'error'
- * and 'unhandledrejection' events, forwarding each to the parent frame via
- * postMessage ({ type: 'studio-console-log' }). The parent persists these to
+ * and 'unhandledrejection' events, forwarding redacted entries to a same-origin
+ * parent frame via postMessage ({ type: 'studio-console-log' }) in development.
+ * The parent persists these to
  * `console.jsonl` inside the sandbox so the Arc Studio agent can read runtime
  * output when diagnosing a broken preview.
  *
@@ -12,9 +13,15 @@
  * flood the parent.
  *
  * Imported as a side-effect before any app code runs. The original console
- * behaviour is always preserved.
+ * behaviour is always preserved; production console methods are not patched.
  * Built with Arc Studio — https://studio.arc.io
  */
+
+import {
+  getTrustedParentOrigin,
+  redactTelemetryText,
+  redactTelemetryValue,
+} from './utils/telemetrySecurity'
 
 type ConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug';
 
@@ -37,30 +44,6 @@ const MAX_REPEAT_BEFORE_FLUSH = 500;
 const NOISE_PREFIXES = ['[studio-trace]'];
 
 const LEVELS: ConsoleLevel[] = ['log', 'info', 'warn', 'error', 'debug'];
-
-// ---------------------------------------------------------------------------
-// Parent origin resolution (mirrors tracing.ts)
-// ---------------------------------------------------------------------------
-
-const _parentOrigin: string = (() => {
-  try {
-    if (window.location.ancestorOrigins?.length) {
-      return window.location.ancestorOrigins[0];
-    }
-  } catch {
-    /* sandboxed iframe may throw */
-  }
-
-  try {
-    if (document.referrer) {
-      return new URL(document.referrer).origin;
-    }
-  } catch {
-    /* malformed referrer */
-  }
-
-  return '*';
-})();
 
 // ---------------------------------------------------------------------------
 // Formatting
@@ -94,18 +77,18 @@ function safeStringify(value: unknown): string {
 
 function formatArg(arg: unknown): string {
   if (typeof arg === 'string') {
-    return arg;
+    return redactTelemetryText(arg);
   }
 
   if (arg instanceof Error) {
-    return arg.stack ?? `${arg.name}: ${arg.message}`;
+    return redactTelemetryText(arg.stack ?? `${arg.name}: ${arg.message}`);
   }
 
   if (arg === undefined) {
     return 'undefined';
   }
 
-  return safeStringify(arg);
+  return safeStringify(redactTelemetryValue(arg));
 }
 
 function truncate(s: string, maxChars: number = MAX_MESSAGE_CHARS): string {
@@ -113,7 +96,7 @@ function truncate(s: string, maxChars: number = MAX_MESSAGE_CHARS): string {
 }
 
 function truncateStack(stack: string | undefined): string | undefined {
-  return stack ? truncate(stack, MAX_STACK_CHARS) : undefined;
+  return stack ? truncate(redactTelemetryText(stack), MAX_STACK_CHARS) : undefined;
 }
 
 function firstErrorStack(args: unknown[]): string | undefined {
@@ -135,8 +118,22 @@ let _windowCount = 0;
 let _dropped = 0;
 
 function send(entry: ConsoleLogEntry): void {
+  const targetOrigin = getTrustedParentOrigin(
+    window.location.origin,
+    import.meta.env.DEV,
+    window.parent !== window,
+  )
+  if (targetOrigin === undefined) return;
+
+  const safeEntry: ConsoleLogEntry = {
+    ...entry,
+    message: redactTelemetryText(entry.message),
+    ...(entry.source === undefined ? {} : { source: redactTelemetryText(entry.source) }),
+    ...(entry.stack === undefined ? {} : { stack: redactTelemetryText(entry.stack) }),
+  };
+
   try {
-    window.parent.postMessage({ type: MESSAGE_TYPE, entry }, _parentOrigin);
+    window.parent.postMessage({ type: MESSAGE_TYPE, entry: safeEntry }, targetOrigin);
   } catch {
     /* ignore — postMessage can throw on cross-origin edge cases */
   }
@@ -208,55 +205,59 @@ function isNoise(message: string): boolean {
 // console.* patching
 // ---------------------------------------------------------------------------
 
-for (const level of LEVELS) {
-  const original = console[level].bind(console);
+if (import.meta.env.DEV) {
+  for (const level of LEVELS) {
+    const original = console[level].bind(console);
 
-  console[level] = (...args: unknown[]): void => {
-    original(...args);
+    console[level] = (...args: unknown[]): void => {
+      original(...args);
 
-    try {
-      const message = truncate(args.map(formatArg).join(' '));
+      try {
+        const message = truncate(args.map(formatArg).join(' '));
 
-      if (message && !isNoise(message)) {
-        emit({ level, message, timestamp: Date.now(), stack: firstErrorStack(args) });
+        if (message && !isNoise(message)) {
+          emit({ level, message, timestamp: Date.now(), stack: firstErrorStack(args) });
+        }
+      } catch {
+        /* never let capture break the app's logging */
       }
-    } catch {
-      /* never let capture break the app's logging */
-    }
-  };
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Uncaught errors & unhandled rejections — the signals a blank preview hides
 // ---------------------------------------------------------------------------
 
-window.addEventListener('error', (e: ErrorEvent) => {
-  try {
-    flushRepeat();
-    const source = e.filename ? `${e.filename}:${e.lineno ?? 0}:${e.colno ?? 0}` : undefined;
-    post({
-      level: 'error',
-      message: truncate(e.message || 'Uncaught error'),
-      timestamp: Date.now(),
-      source,
-      stack: e.error instanceof Error ? truncateStack(e.error.stack) : undefined,
-    });
-  } catch {
-    /* ignore */
-  }
-});
+if (import.meta.env.DEV) {
+  window.addEventListener('error', (e: ErrorEvent) => {
+    try {
+      flushRepeat();
+      const source = e.filename ? `${e.filename}:${e.lineno ?? 0}:${e.colno ?? 0}` : undefined;
+      post({
+        level: 'error',
+        message: truncate(e.message || 'Uncaught error'),
+        timestamp: Date.now(),
+        source,
+        stack: e.error instanceof Error ? truncateStack(e.error.stack) : undefined,
+      });
+    } catch {
+      /* ignore */
+    }
+  });
 
-window.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
-  try {
-    flushRepeat();
-    const reason: unknown = e.reason;
-    post({
-      level: 'error',
-      message: truncate(`Unhandled promise rejection: ${formatArg(reason)}`),
-      timestamp: Date.now(),
-      stack: reason instanceof Error ? truncateStack(reason.stack) : undefined,
-    });
-  } catch {
-    /* ignore */
-  }
-});
+  window.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
+    try {
+      flushRepeat();
+      const reason: unknown = e.reason;
+      post({
+        level: 'error',
+        message: truncate(`Unhandled promise rejection: ${formatArg(reason)}`),
+        timestamp: Date.now(),
+        stack: reason instanceof Error ? truncateStack(reason.stack) : undefined,
+      });
+    } catch {
+      /* ignore */
+    }
+  });
+}
