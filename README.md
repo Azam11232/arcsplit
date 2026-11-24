@@ -95,7 +95,7 @@ requires Arc Mainnet (chain ID 5042), and checks the existing contract and predi
 showing the gas estimate. It only permits the expected deployer
 `0xBCCb7750dE26b1A1AC3a18cE08Be01eCd4094c6C` and requires a separate on-page approval followed by confirmation
 in MetaMask or OKX; it never requests a private key or switches networks. This flow does not change
-`VITE_ARCSPLIT_ADDRESS`.
+the active Mainnet contract selection or the running application configuration.
 The active Mainnet contract is already F131. This review page is only for a separately authorized future deployment; it does not deploy or activate the existing contract.
 
 ## Quick Start
@@ -121,8 +121,9 @@ The development server starts at `http://localhost:5173`.
 The application uses the verified ArcSplit Mainnet contract at
 `0xF13199D9bbf965eE10f41b531Ee4aa660bB54738` for Mainnet transactions.
 The former Mainnet contract at `0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E`
-is retained for historical analytics. Mainnet contract addresses are defined
-in `src/utils/arcsplit.ts`, not through `.env.example`.
+is retired and excluded from Analytics. Analytics tracks only the current
+Mainnet contract. Mainnet contract addresses are defined in
+`src/utils/arcsplit.ts`, not through `.env.example`.
 
 `VITE_ARCSPLIT_TESTNET_ADDRESS` can optionally override the configured
 Testnet contract address.
@@ -135,7 +136,7 @@ Never commit private keys, API secrets, or your actual `.env` file.
 `contracts/script/DeployArcSplitMainnet.s.sol` is a separate Foundry deployment script with a hard chain-ID
 guard for `5042` and the registered Mainnet USDC constructor address. The script deploys the current
 `contracts/ArcSplit.sol` source using the repository's Solidity `0.8.28` compiler configuration. The frontend selects F131 through the source-level `ARCSPLIT_MAINNET_USE_NEXT_ADDRESS` setting in `src/utils/arcsplit.ts`. The environment variable `VITE_ARCSPLIT_MAINNET_USE_NEXT_ADDRESS` is not read by the application. The former Mainnet contract
-remains in analytics scanning for history. The isolated Foundry profile and prepared RPC alias are both
+is excluded from Analytics. The isolated Foundry profile and prepared RPC alias are both
 `arc_mainnet`. Do not run the script unless a separate deployment is explicitly authorized.
 
 #### Contract compatibility and source provenance

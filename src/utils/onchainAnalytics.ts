@@ -8,6 +8,7 @@ import {
 import type { Address, Hash, Hex, PublicClient } from 'viem'
 import { getArcNetwork } from './arcsplit'
 import type { SplitHistoryEntry } from './splitStorage'
+import { redactTelemetryText } from './telemetrySecurity'
 
 const distributedEvent = parseAbiItem(
   'event Distributed(address indexed payer, uint256 totalAmount, uint256 recipientCount)',
@@ -20,10 +21,14 @@ const recipientPayoutTopic = toEventSelector(recipientPayoutEvent)
 
 const LOG_BLOCK_RANGE = 10_000n
 const RECEIPT_CONCURRENCY = 4
+const RPC_MAX_CONCURRENT_REQUESTS = 1
+const RPC_MIN_LOG_REQUEST_INTERVAL_MS = 300
 const RPC_TIMEOUT_MS = 12_000
-const RPC_RETRY_DELAY_MS = 250
-const RPC_MAX_ATTEMPTS = 2
-const CACHE_VERSION = 1
+const RPC_RETRY_BASE_DELAY_MS = 250
+const RPC_RETRY_MAX_DELAY_MS = 8_000
+const RPC_RETRY_AFTER_MAX_MS = 60_000
+const RPC_MAX_ATTEMPTS = 4
+const CACHE_VERSION = 2
 const CACHE_PREFIX = 'arcsplit:onchain-analytics'
 
 type EventLog = {
@@ -71,7 +76,7 @@ export interface OnchainDistributionRecord {
 }
 
 export interface OnchainScanProgress {
-  phase: 'discovering' | 'scanning' | 'verifying'
+  phase: 'discovering' | 'revalidating' | 'scanning' | 'verifying'
   fromBlock?: bigint
   toBlock?: bigint
   blocksScanned: bigint
@@ -135,6 +140,10 @@ function markLiveVerifiedDistributionRecord(record: OnchainDistributionRecord): 
 
 const deploymentBlocks = new Map<string, bigint>()
 const scanCaches = new Map<string, WalletScanCache>()
+let activeRpcRequests = 0
+const queuedRpcRequests: Array<() => void> = []
+let nextLogRequestAt = 0
+let rpcCooldownUntil = 0
 const scanJobs = new Map<string, {
   promise: Promise<OnchainScanResult>
   listeners: Set<(progress: OnchainScanProgress) => void>
@@ -290,7 +299,7 @@ export function readOnchainScanCache(
     const recordIds = new Set<string>()
     for (const item of envelope.records) {
       const record = validateCachedRecord(item, options, deploymentBlock, scannedThroughBlock)
-      if (!record || recordIds.has(record.id)) throw new Error('Invalid cached receipt-verified record.')
+      if (!record || recordIds.has(record.id)) throw new Error('Invalid cached distribution record.')
       recordIds.add(record.id)
       records.push(record)
     }
@@ -373,9 +382,115 @@ function errorText(error: unknown): string {
   return parts.filter((part) => part.trim()).join(' | ') || 'Unknown RPC error.'
 }
 
+async function withRpcRequestLimit<T>(request: () => Promise<T>): Promise<T> {
+  await new Promise<void>((resolve) => {
+    if (activeRpcRequests < RPC_MAX_CONCURRENT_REQUESTS) {
+      activeRpcRequests += 1
+      resolve()
+    } else {
+      queuedRpcRequests.push(() => {
+        activeRpcRequests += 1
+        resolve()
+      })
+    }
+  })
+
+  try {
+    return await request()
+  } finally {
+    activeRpcRequests -= 1
+    queuedRpcRequests.shift()?.()
+  }
+}
+
+async function waitForRpcRequestStart(method: string | undefined): Promise<void> {
+  const now = Date.now()
+  const isLogRequest = method === 'eth_getLogs'
+  const startAt = Math.max(
+    rpcCooldownUntil,
+    isLogRequest ? nextLogRequestAt : 0,
+  )
+  if (startAt > now) {
+    await new Promise((resolve) => setTimeout(resolve, startAt - now))
+  }
+  if (isLogRequest) nextLogRequestAt = Date.now() + RPC_MIN_LOG_REQUEST_INTERVAL_MS
+}
+
+function rpcErrorStatus(error: unknown): number | undefined {
+  const visited = new Set<object>()
+  let current = error
+
+  while (typeof current === 'object' && current !== null && !visited.has(current)) {
+    visited.add(current)
+    const record = current as Record<string, unknown>
+    if (typeof record.status === 'number') return record.status
+    current = record.cause
+  }
+
+  return undefined
+}
+
+function retryAfterMilliseconds(error: unknown): number | undefined {
+  const visited = new Set<object>()
+  let current = error
+
+  while (typeof current === 'object' && current !== null && !visited.has(current)) {
+    visited.add(current)
+    const record = current as Record<string, unknown>
+    const headers = record.headers
+    let value: string | null | undefined
+
+    if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+      value = headers.get('Retry-After')
+    } else if (
+      typeof headers === 'object'
+      && headers !== null
+      && 'get' in headers
+      && typeof headers.get === 'function'
+    ) {
+      const getHeader = headers.get as (name: string) => string | null
+      value = getHeader.call(headers, 'Retry-After')
+    }
+
+    if (value) {
+      const seconds = Number(value.trim())
+      if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000
+      const retryAt = Date.parse(value)
+      if (Number.isFinite(retryAt)) return Math.max(0, retryAt - Date.now())
+    }
+
+    current = record.cause
+  }
+
+  return undefined
+}
+
+function retryDelayMilliseconds(error: unknown, attempt: number): number | undefined {
+  const retryAfter = retryAfterMilliseconds(error)
+  if (retryAfter !== undefined && retryAfter > RPC_RETRY_AFTER_MAX_MS) return undefined
+
+  const backoff = Math.min(
+    RPC_RETRY_MAX_DELAY_MS,
+    RPC_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)),
+  )
+  const jitteredBackoff = Math.floor(backoff * (0.5 + Math.random() * 0.5))
+  return Math.max(jitteredBackoff, retryAfter ?? 0)
+}
+
+function isRateLimitError(error: unknown): boolean {
+  if (rpcErrorStatus(error) === 429) return true
+  const message = errorText(error).toLowerCase()
+  return ['rate limit', 'too many requests', 'http 429', '429'].some((phrase) =>
+    message.includes(phrase),
+  )
+}
+
 function isRangeLimitError(error: unknown): boolean {
+  if (isRateLimitError(error)) return false
   const message = errorText(error).toLowerCase()
   return [
+    'request exceeds defined limit',
+    'exceeds the defined limit',
     'block range',
     'range limit',
     'range too large',
@@ -389,6 +504,9 @@ function isRangeLimitError(error: unknown): boolean {
 }
 
 function isTransientRpcError(error: unknown): boolean {
+  const status = rpcErrorStatus(error)
+  if (status !== undefined && [429, 502, 503, 504].includes(status)) return true
+
   const message = errorText(error).toLowerCase()
   return [
     'fetch failed',
@@ -420,32 +538,87 @@ function isTransientRpcError(error: unknown): boolean {
   ].some((phrase) => message.includes(phrase))
 }
 
-async function requestWithRetry<T>(operation: string, request: () => Promise<T>): Promise<T> {
-  let lastError: unknown
-  for (let attempt = 1; attempt <= RPC_MAX_ATTEMPTS; attempt += 1) {
-    let timeout: ReturnType<typeof setTimeout> | undefined
-    try {
-      return await Promise.race([
-        request(),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(
-            () => reject(new Error(`${operation} timed out after ${RPC_TIMEOUT_MS / 1_000} seconds.`)),
-            RPC_TIMEOUT_MS,
-          )
-        }),
-      ])
-    } catch (error) {
-      lastError = error
-      if (attempt === RPC_MAX_ATTEMPTS || isRangeLimitError(error) || !isTransientRpcError(error)) {
-        throw error
-      }
-    } finally {
-      if (timeout !== undefined) clearTimeout(timeout)
-    }
+interface RpcDiagnosticContext {
+  method: string
+  contractAddress: Address
+  blockNumber?: bigint
+  fromBlock?: bigint
+  toBlock?: bigint
+}
 
-    await new Promise((resolve) => setTimeout(resolve, RPC_RETRY_DELAY_MS))
+function logRpcDiagnostic(
+  context: RpcDiagnosticContext,
+  attempt: number,
+  durationMs: number,
+  error?: unknown,
+  failed = false,
+): void {
+  if (!import.meta.env.DEV) return
+
+  const details = {
+    method: context.method,
+    contractAddress: context.contractAddress,
+    ...(context.blockNumber === undefined ? {} : { blockNumber: context.blockNumber.toString() }),
+    ...(context.fromBlock === undefined ? {} : { fromBlock: context.fromBlock.toString() }),
+    ...(context.toBlock === undefined ? {} : { toBlock: context.toBlock.toString() }),
+    attempt,
+    durationMs,
+    ...(failed ? { error: redactTelemetryText(errorText(error)).slice(0, 300) } : {}),
   }
-  throw lastError
+  if (failed) {
+    console.warn('[ArcSplit analytics RPC]', details)
+  } else {
+    console.debug('[ArcSplit analytics RPC]', details)
+  }
+}
+
+async function requestWithRetry<T>(
+  operation: string,
+  request: () => Promise<T>,
+  diagnostics?: RpcDiagnosticContext,
+): Promise<T> {
+  return withRpcRequestLimit(async () => {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= RPC_MAX_ATTEMPTS; attempt += 1) {
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      await waitForRpcRequestStart(diagnostics?.method)
+      const startedAt = Date.now()
+      try {
+        const result = await Promise.race([
+          request(),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error(`${operation} timed out after ${RPC_TIMEOUT_MS / 1_000} seconds.`)),
+              RPC_TIMEOUT_MS,
+            )
+          }),
+        ])
+        if (diagnostics) logRpcDiagnostic(diagnostics, attempt, Date.now() - startedAt)
+        return result
+      } catch (error) {
+        lastError = error
+        if (diagnostics) logRpcDiagnostic(diagnostics, attempt, Date.now() - startedAt, error, true)
+        const rateLimited = isRateLimitError(error)
+        const retryDelay = retryDelayMilliseconds(error, attempt)
+        if (rateLimited) {
+          const retryAfter = retryAfterMilliseconds(error)
+          const cooldown = retryDelay ?? retryAfter ?? RPC_RETRY_BASE_DELAY_MS
+          rpcCooldownUntil = Math.max(rpcCooldownUntil, Date.now() + cooldown)
+        }
+        if (attempt === RPC_MAX_ATTEMPTS || isRangeLimitError(error) || !isTransientRpcError(error)) {
+          throw error
+        }
+        const delay = retryDelay ?? retryDelayMilliseconds(error, attempt)
+        if (delay === undefined) {
+          throw error
+        }
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout)
+      }
+    }
+    throw lastError
+  })
 }
 
 export function createBlockRanges(
@@ -486,7 +659,7 @@ async function findDeploymentBlock(
     client.getBytecode({
       address: contractAddress,
       blockNumber: latestBlock,
-    }))
+    }), { method: 'eth_getCode', contractAddress, blockNumber: latestBlock })
   if (!latestCode || latestCode === '0x') {
     throw new Error(`No ArcSplit contract code was found at ${contractAddress} on this network.`)
   }
@@ -500,7 +673,7 @@ async function findDeploymentBlock(
         client.getBytecode({
           address: contractAddress,
           blockNumber: middle,
-        }))
+        }), { method: 'eth_getCode', contractAddress, blockNumber: middle })
       if (code && code !== '0x') high = middle
       else low = middle + 1n
     }
@@ -520,11 +693,13 @@ async function validateDeploymentBlockHint(
   candidate: bigint,
 ): Promise<boolean> {
   const codeAtCandidate = await requestWithRetry('Validating the saved ArcSplit deployment block', () =>
-    client.getBytecode({ address: contractAddress, blockNumber: candidate }))
+    client.getBytecode({ address: contractAddress, blockNumber: candidate }),
+  { method: 'eth_getCode', contractAddress, blockNumber: candidate })
   if (!codeAtCandidate || codeAtCandidate === '0x') return false
   if (candidate === 0n) return true
   const codeBeforeCandidate = await requestWithRetry('Validating the saved ArcSplit deployment block', () =>
-    client.getBytecode({ address: contractAddress, blockNumber: candidate - 1n }))
+    client.getBytecode({ address: contractAddress, blockNumber: candidate - 1n }),
+  { method: 'eth_getCode', contractAddress, blockNumber: candidate - 1n })
   return !codeBeforeCandidate || codeBeforeCandidate === '0x'
 }
 
@@ -798,8 +973,18 @@ async function revalidateCachedRecords(
   client: PublicClient,
   records: OnchainDistributionRecord[],
   options: Pick<OnchainScanOptions, 'chainId' | 'contractAddress' | 'networkName' | 'payer'>,
+  onProgress?: OnchainScanOptions['onProgress'],
 ): Promise<{ records: OnchainDistributionRecord[]; modified: boolean }> {
+  if (records.length === 0) return { records, modified: false }
+
   let modified = false
+  onProgress?.({
+    phase: 'revalidating',
+    blocksScanned: 0n,
+    totalBlocks: 0n,
+    receiptsChecked: 0,
+    totalReceipts: records.length,
+  })
   const verifiedRecords = await mapInBatches(
     records,
     RECEIPT_CONCURRENCY,
@@ -807,6 +992,7 @@ async function revalidateCachedRecords(
       const receipt = receiptForVerification(await requestWithRetry(
         'Revalidating a cached ArcSplit transaction receipt',
         () => client.getTransactionReceipt({ hash: cachedRecord.txHash }),
+        { method: 'eth_getTransactionReceipt', contractAddress: options.contractAddress },
       ))
       if (
         receipt.transactionHash.toLowerCase() !== cachedRecord.txHash.toLowerCase()
@@ -826,7 +1012,12 @@ async function revalidateCachedRecords(
       }
 
       const block = await requestWithRetry('Revalidating a cached ArcSplit block', () =>
-        client.getBlock({ blockNumber: receipt.blockNumber }))
+        client.getBlock({ blockNumber: receipt.blockNumber }),
+      {
+        method: 'eth_getBlockByNumber',
+        contractAddress: options.contractAddress,
+        blockNumber: receipt.blockNumber,
+      })
       let verified: OnchainDistributionRecord
       try {
         verified = verifyDistributionReceipt(
@@ -849,6 +1040,13 @@ async function revalidateCachedRecords(
       return verified
     },
     () => {},
+    (completed) => onProgress?.({
+      phase: 'revalidating',
+      blocksScanned: 0n,
+      totalBlocks: 0n,
+      receiptsChecked: completed,
+      totalReceipts: records.length,
+    }),
   )
 
   return { records: verifiedRecords, modified }
@@ -859,11 +1057,18 @@ async function mapInBatches<T, R>(
   batchSize: number,
   mapper: (item: T) => Promise<R>,
   onBatchComplete: (completed: number) => void,
+  onItemComplete?: (completed: number) => void,
 ): Promise<R[]> {
   const results: R[] = []
+  let completedItems = 0
   for (let start = 0; start < items.length; start += batchSize) {
     const batch = items.slice(start, start + batchSize)
-    results.push(...await Promise.all(batch.map(mapper)))
+    results.push(...await Promise.all(batch.map(async (item) => {
+      const result = await mapper(item)
+      completedItems += 1
+      onItemComplete?.(completedItems)
+      return result
+    })))
     onBatchComplete(results.length)
   }
   return results
@@ -907,9 +1112,11 @@ async function performOnchainScan(
   })
 
   const latestBlock = await requestWithRetry('Reading the latest Arc block number', () =>
-    client.getBlockNumber())
+    client.getBlockNumber(),
+  { method: 'eth_blockNumber', contractAddress })
   const latest = await requestWithRetry('Reading the latest Arc block', () =>
-    client.getBlock({ blockNumber: latestBlock }))
+    client.getBlock({ blockNumber: latestBlock }),
+  { method: 'eth_getBlockByNumber', contractAddress, blockNumber: latestBlock })
   if (deploymentBlockHint !== undefined) {
     if (deploymentBlockHint > latestBlock
       || !await validateDeploymentBlockHint(client, contractAddress, deploymentBlockHint)) {
@@ -931,7 +1138,8 @@ async function performOnchainScan(
         checkpointHash = previous.scannedThroughBlock === latestBlock
           ? latest.hash
           : (await requestWithRetry('Validating the cached Arc block', () =>
-            client.getBlock({ blockNumber: checkpointBlock }))).hash
+            client.getBlock({ blockNumber: checkpointBlock }),
+          { method: 'eth_getBlockByNumber', contractAddress, blockNumber: checkpointBlock })).hash
       } catch (error) {
         throw new Error(
           `Could not validate cached analytics checkpoint block ${previous.scannedThroughBlock}. ${errorText(error)}`,
@@ -956,7 +1164,7 @@ async function performOnchainScan(
       ].filter(Boolean).join(' ')
     } else {
       try {
-        const revalidated = await revalidateCachedRecords(client, previous.records, options)
+        const revalidated = await revalidateCachedRecords(client, previous.records, options, onProgress)
         if (revalidated.modified) {
           previous = undefined
           cacheWarning = [
@@ -980,7 +1188,8 @@ async function performOnchainScan(
   const deploymentBlockData = deploymentBlock === latestBlock
     ? latest
     : await requestWithRetry('Reading the ArcSplit deployment block timestamp', () =>
-      client.getBlock({ blockNumber: deploymentBlock }))
+      client.getBlock({ blockNumber: deploymentBlock }),
+    { method: 'eth_getBlockByNumber', contractAddress, blockNumber: deploymentBlock })
   const deploymentTimestamp = Number(deploymentBlockData.timestamp) * 1_000
   if (!Number.isSafeInteger(deploymentTimestamp) || deploymentTimestamp <= 0) {
     throw new Error('The ArcSplit deployment block has an invalid timestamp.')
@@ -1009,7 +1218,7 @@ async function performOnchainScan(
           args: { payer },
           fromBlock,
           toBlock,
-        }))
+        }), { method: 'eth_getLogs', contractAddress, fromBlock, toBlock })
       pendingLogs.push(...logs.filter((log) => !log.removed))
       blocksScanned += toBlock - fromBlock + 1n
       onProgress?.({
@@ -1087,14 +1296,17 @@ async function performOnchainScan(
       let receiptRequest = receipts.get(normalizedHash)
       if (!receiptRequest) {
         receiptRequest = requestWithRetry('Verifying an ArcSplit transaction receipt', () =>
-          client.getTransactionReceipt({ hash }))
+          client.getTransactionReceipt({ hash }),
+        { method: 'eth_getTransactionReceipt', contractAddress })
         receipts.set(normalizedHash, receiptRequest)
       }
       const [receipt, block] = await Promise.all([
         receiptRequest,
         blocks.get(blockNumber) ?? (() => {
           const request = requestWithRetry('Reading an Arc transaction block', () =>
-            client.getBlock({ blockNumber })).then(({ timestamp, hash }) => ({ timestamp, hash }))
+            client.getBlock({ blockNumber }),
+          { method: 'eth_getBlockByNumber', contractAddress, blockNumber })
+            .then(({ timestamp, hash }) => ({ timestamp, hash }))
           blocks.set(blockNumber, request)
           return request
         })(),
@@ -1132,13 +1344,15 @@ async function performOnchainScan(
   if (previous && previous.scannedThroughBlock < latestBlock) {
     const checkpointBlock = previous.scannedThroughBlock
     const confirmedCheckpoint = await requestWithRetry('Rechecking the cached Arc block', () =>
-      client.getBlock({ blockNumber: checkpointBlock }))
+      client.getBlock({ blockNumber: checkpointBlock }),
+    { method: 'eth_getBlockByNumber', contractAddress, blockNumber: checkpointBlock })
     if (confirmedCheckpoint.hash.toLowerCase() !== previous.scannedThroughHash.toLowerCase()) {
       throw new Error('The saved Arc chain checkpoint changed during analytics; retry the scan.')
     }
   }
   const confirmedLatest = await requestWithRetry('Rechecking the latest Arc block', () =>
-    client.getBlock({ blockNumber: latestBlock }))
+    client.getBlock({ blockNumber: latestBlock }),
+  { method: 'eth_getBlockByNumber', contractAddress, blockNumber: latestBlock })
   if (confirmedLatest.hash.toLowerCase() !== latest.hash.toLowerCase()) {
     throw new Error('The Arc chain head changed during analytics; retry the scan.')
   }

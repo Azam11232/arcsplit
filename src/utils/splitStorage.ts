@@ -151,6 +151,13 @@ function read(address: string | undefined, chainId: number | undefined): StoredD
   }
 }
 
+export function getSplitStorageData(
+  address: string | undefined,
+  chainId: number | undefined,
+): StoredData {
+  return read(address, chainId)
+}
+
 function write(address: string | undefined, chainId: number | undefined, data: StoredData): boolean {
   const storage = getLocalStorage()
   if (!storage) return false

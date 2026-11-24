@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import { encodeAbiParameters, parseAbiItem, toEventSelector } from 'viem'
+import { encodeAbiParameters, HttpRequestError, parseAbiItem, toEventSelector } from 'viem'
 import type { Address, Hash, Hex, PublicClient } from 'viem'
-import { getArcNetwork } from './arcsplit'
+import { ARCSPLIT_MAINNET_LEGACY_ADDRESS, getArcNetwork } from './arcsplit'
 import { calculateSplitAnalytics } from './analytics'
 import {
   createBlockRanges,
@@ -116,6 +116,24 @@ function fixtureReceipt(
   }
 }
 
+function persistAnalyticsCache(
+  storage: Storage,
+  address: Address,
+  records: Array<ReturnType<typeof verifyDistributionReceipt>>,
+) {
+  storage.setItem(`arcsplit:onchain-analytics:v2:5042:${address}:${payer}`, JSON.stringify({
+    version: 2,
+    complete: true,
+    chainId: 5042,
+    contractAddress: address,
+    payer,
+    deploymentBlock: '10',
+    scannedThroughBlock: '20',
+    scannedThroughHash: blockHash,
+    records: records.map((record) => ({ ...record, blockNumber: record.blockNumber.toString() })),
+  }))
+}
+
 describe('on-chain ArcSplit analytics', () => {
   it('creates bounded, inclusive block ranges without gaps', () => {
     expect(createBlockRanges(10n, 25n, 6n)).toEqual([
@@ -221,6 +239,37 @@ describe('on-chain ArcSplit analytics', () => {
     expect(progress.some((item) => item.phase === 'verifying' && item.blocksScanned === 11n)).toBe(true)
     expect(calculateSplitAnalytics(result.records).totalRaw).toBe(1_500_000n)
     expect(calculateSplitAnalytics(result.records).weekly[0]?.totalRaw).toBe(1_500_000n)
+  })
+
+  it('splits the exact request-limit error into complete inclusive ranges', async () => {
+    const rangeContract = '0x7878787878787878787878787878787878787878' as Address
+    const requests: Array<{ fromBlock: bigint; toBlock: bigint }> = []
+    const client = {
+      getBlockNumber: vi.fn(async () => 10n),
+      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
+      getBytecode: vi.fn(async () => '0x6000' as Hex),
+      getLogs: vi.fn(async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
+        requests.push({ fromBlock, toBlock })
+        if (fromBlock === 0n && toBlock === 10n) {
+          throw new Error('Request exceeds defined limit')
+        }
+        return []
+      }),
+    } as unknown as PublicClient
+
+    const result = await scanOnchainDistributions(client, {
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: rangeContract,
+      payer,
+    })
+
+    expect(requests).toEqual([
+      { fromBlock: 0n, toBlock: 10n },
+      { fromBlock: 0n, toBlock: 5n },
+      { fromBlock: 6n, toBlock: 10n },
+    ])
+    expect(result.coverage.scannedThroughBlock).toBe(10n)
   })
 
   it('keeps separate distributions emitted in one transaction and aggregates each event once', async () => {
@@ -333,10 +382,11 @@ describe('on-chain ArcSplit analytics', () => {
       payer,
       { chainId: 5042, networkName: 'Arc Mainnet', contractAddress: contract },
     )
-    const key = `arcsplit:onchain-analytics:v1:5042:${contract}:${payer}`
+    const key = `arcsplit:onchain-analytics:v2:5042:${contract}:${payer}`
     storage.setItem(key, JSON.stringify({
-      version: 1,
+      version: 2,
       complete: true,
+      recordsPreviouslyReceiptVerified: true,
       chainId: 5042,
       contractAddress: contract,
       payer,
@@ -354,6 +404,7 @@ describe('on-chain ArcSplit analytics', () => {
     }, storage)
     expect(cached.snapshot?.records).toHaveLength(1)
     expect(cached.snapshot?.records[0]?.verificationStatus).toBe('unverified')
+    expect(cached.snapshot).not.toHaveProperty('cacheProvenance')
     expect(readOnchainScanCache({
       chainId: 5042002,
       networkName: 'Arc Testnet',
@@ -368,8 +419,9 @@ describe('on-chain ArcSplit analytics', () => {
     }, storage).snapshot).toBeUndefined()
 
     storage.setItem(key, JSON.stringify({
-      version: 1,
+      version: 2,
       complete: true,
+      recordsPreviouslyReceiptVerified: true,
       chainId: 5042,
       contractAddress: contract,
       payer,
@@ -386,6 +438,85 @@ describe('on-chain ArcSplit analytics', () => {
     }, storage)
     expect(cachedUnverified.snapshot?.records).toHaveLength(1)
     expect(cachedUnverified.snapshot?.records[0]?.verificationStatus).toBe('unverified')
+
+    for (const provenanceMarker of [true, false]) {
+      storage.setItem(key, JSON.stringify({
+        version: 2,
+        complete: true,
+        recordsPreviouslyReceiptVerified: provenanceMarker,
+        chainId: 5042,
+        contractAddress: contract,
+        payer,
+        deploymentBlock: '10',
+        scannedThroughBlock: '20',
+        scannedThroughHash: blockHash,
+        records: [{
+          ...verified,
+          blockNumber: verified.blockNumber.toString(),
+          totalRaw: '2000000',
+        }],
+      }))
+      const invalidCachedRecord = readOnchainScanCache({
+        chainId: 5042,
+        networkName: 'Arc Mainnet',
+        contractAddress: contract,
+        payer,
+      }, storage)
+      expect(invalidCachedRecord.snapshot).toBeUndefined()
+      expect(invalidCachedRecord.warning).toMatch(/invalid/i)
+    }
+
+    for (const provenanceMarker of [true, false]) {
+      storage.setItem(key, JSON.stringify({
+        version: 2,
+        complete: true,
+        recordsPreviouslyReceiptVerified: provenanceMarker,
+        chainId: 5042,
+        contractAddress: contract,
+        payer,
+        deploymentBlock: '10',
+        scannedThroughBlock: '20',
+        scannedThroughHash: blockHash,
+        records: [{
+          ...verified,
+          blockNumber: verified.blockNumber.toString(),
+          totalRaw: '2000000',
+          recipients: [
+            { address: alice, amountRaw: '1500000' },
+            { address: bob, amountRaw: '500000' },
+          ],
+        }],
+      }))
+      const manipulatedCache = readOnchainScanCache({
+        chainId: 5042,
+        networkName: 'Arc Mainnet',
+        contractAddress: contract,
+        payer,
+      }, storage)
+      expect(manipulatedCache.snapshot?.records[0]?.totalRaw).toBe('2000000')
+      expect(manipulatedCache.snapshot?.records[0]?.verificationStatus).toBe('unverified')
+      expect(manipulatedCache.snapshot).not.toHaveProperty('cacheProvenance')
+    }
+
+    storage.setItem(key, JSON.stringify({
+      version: 2,
+      complete: true,
+      chainId: 5042,
+      contractAddress: contract,
+      payer,
+      deploymentBlock: '10',
+      scannedThroughBlock: '20',
+      scannedThroughHash: blockHash,
+      records: [{ ...verified, blockNumber: verified.blockNumber.toString() }],
+    }))
+    const cachedWithoutMarker = readOnchainScanCache({
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: contract,
+      payer,
+    }, storage)
+    expect(cachedWithoutMarker.snapshot?.records).toHaveLength(1)
+    expect(cachedWithoutMarker.snapshot?.records[0]?.verificationStatus).toBe('unverified')
   })
 
   it('resumes a persisted checkpoint only after validating deployment and cached receipts', async () => {
@@ -401,9 +532,10 @@ describe('on-chain ArcSplit analytics', () => {
         payer,
         { chainId: 5042, networkName: 'Arc Mainnet', contractAddress: incrementalContract },
       )
-      storage.setItem(`arcsplit:onchain-analytics:v1:5042:${incrementalContract}:${payer}`, JSON.stringify({
-        version: 1,
+      storage.setItem(`arcsplit:onchain-analytics:v2:5042:${incrementalContract}:${payer}`, JSON.stringify({
+        version: 2,
         complete: true,
+        recordsPreviouslyReceiptVerified: true,
         chainId: 5042,
         contractAddress: incrementalContract,
         payer,
@@ -450,6 +582,191 @@ describe('on-chain ArcSplit analytics', () => {
     }
   })
 
+  it('reports cached receipt progress per record and transitions to event scanning', async () => {
+    const storage = createMemoryStorage()
+    const progressContract = '0x6767676767676767676767676767676767676767' as Address
+    const secondTxHash: Hash = `0x${'b'.repeat(64)}`
+    const latestHash = `0x${'d'.repeat(64)}`
+    vi.stubGlobal('localStorage', storage)
+    try {
+      const events = [
+        fixtureEvent(progressContract, txHash, 13n),
+        fixtureEvent(progressContract, secondTxHash, 15n),
+      ]
+      const records = events.map((event) => verifyDistributionReceipt(
+        event,
+        fixtureReceipt(event),
+        { timestamp, hash: blockHash },
+        payer,
+        { chainId: 5042, networkName: 'Arc Mainnet', contractAddress: progressContract },
+      ))
+      persistAnalyticsCache(storage, progressContract, records)
+
+      let releaseSecondBlock: ((block: { timestamp: bigint; hash: Hash }) => void) | undefined
+      const secondBlockRequest = new Promise<{ timestamp: bigint; hash: Hash }>((resolve) => {
+        releaseSecondBlock = resolve
+      })
+      let reportFirstVerified: (() => void) | undefined
+      const firstVerified = new Promise<void>((resolve) => {
+        reportFirstVerified = resolve
+      })
+      const progress: Array<{
+        phase: string
+        fromBlock?: bigint
+        receiptsChecked: number
+        totalReceipts: number
+      }> = []
+      const client = {
+        getBlockNumber: vi.fn(() => Promise.resolve(25n)),
+        getBlock: vi.fn(({ blockNumber }: { blockNumber: bigint }) =>
+          blockNumber === 15n
+            ? secondBlockRequest
+            : Promise.resolve({
+            timestamp,
+            hash: blockNumber === 25n ? latestHash : blockHash,
+            })),
+        getBytecode: vi.fn(({ blockNumber }: { blockNumber: bigint }) =>
+          Promise.resolve(blockNumber >= 10n ? '0x6000' : '0x')),
+        getTransactionReceipt: vi.fn(({ hash }: { hash: Hash }) =>
+          Promise.resolve(fixtureReceipt(events.find((event) => event.transactionHash === hash)))),
+        getLogs: vi.fn(() => Promise.resolve([])),
+      } as unknown as PublicClient
+
+      const scan = scanOnchainDistributions(client, {
+        chainId: 5042,
+        networkName: 'Arc Mainnet',
+        contractAddress: progressContract,
+        payer,
+        onProgress: (item) => {
+          progress.push({
+            phase: item.phase,
+            ...(item.fromBlock === undefined ? {} : { fromBlock: item.fromBlock }),
+            receiptsChecked: item.receiptsChecked,
+            totalReceipts: item.totalReceipts,
+          })
+          if (item.phase === 'revalidating' && item.receiptsChecked === 1) {
+            reportFirstVerified?.()
+          }
+        },
+      })
+
+      await firstVerified
+      expect(progress).toContainEqual({
+        phase: 'revalidating',
+        receiptsChecked: 1,
+        totalReceipts: 2,
+      })
+      expect(progress).not.toContainEqual(expect.objectContaining({
+        phase: 'revalidating',
+        receiptsChecked: 2,
+        totalReceipts: 2,
+      }))
+
+      if (!releaseSecondBlock) throw new Error('Second cached block verification did not start.')
+      releaseSecondBlock({ timestamp, hash: blockHash })
+      await scan
+
+      expect(progress.filter((item) => item.phase === 'revalidating')
+        .map((item) => item.receiptsChecked)).toEqual([0, 1, 2])
+      const completedRevalidationIndex = progress.findIndex((item) =>
+        item.phase === 'revalidating' && item.receiptsChecked === 2)
+      expect(progress.slice(completedRevalidationIndex + 1)).toContainEqual(expect.objectContaining({
+        phase: 'scanning',
+        fromBlock: 21n,
+      }))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('does not report cached records complete when receipt revalidation fails', async () => {
+    const storage = createMemoryStorage()
+    const failureContract = '0x6868686868686868686868686868686868686868' as Address
+    vi.stubGlobal('localStorage', storage)
+    try {
+      const event = fixtureEvent(failureContract)
+      const record = verifyDistributionReceipt(
+        event,
+        fixtureReceipt(event),
+        { timestamp, hash: blockHash },
+        payer,
+        { chainId: 5042, networkName: 'Arc Mainnet', contractAddress: failureContract },
+      )
+      persistAnalyticsCache(storage, failureContract, [record])
+      const progress: Array<{ phase: string; receiptsChecked: number; totalReceipts: number }> = []
+      const client = {
+        getBlockNumber: vi.fn(() => Promise.resolve(25n)),
+        getBlock: vi.fn(() => Promise.resolve({ timestamp, hash: blockHash })),
+        getBytecode: vi.fn(({ blockNumber }: { blockNumber: bigint }) =>
+          Promise.resolve(blockNumber >= 10n ? '0x6000' : '0x')),
+        getTransactionReceipt: vi.fn(() => Promise.reject(new Error('malformed receipt response'))),
+        getLogs: vi.fn(() => Promise.resolve([])),
+      } as unknown as PublicClient
+
+      await expect(scanOnchainDistributions(client, {
+        chainId: 5042,
+        networkName: 'Arc Mainnet',
+        contractAddress: failureContract,
+        payer,
+        onProgress: (item) => progress.push({
+          phase: item.phase,
+          receiptsChecked: item.receiptsChecked,
+          totalReceipts: item.totalReceipts,
+        }),
+      })).rejects.toThrow(/malformed receipt response/i)
+
+      expect(progress).toContainEqual({
+        phase: 'revalidating',
+        receiptsChecked: 0,
+        totalReceipts: 1,
+      })
+      expect(progress).not.toContainEqual(expect.objectContaining({
+        phase: 'revalidating',
+        receiptsChecked: 1,
+        totalReceipts: 1,
+      }))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('skips cached receipt revalidation progress for an empty cache', async () => {
+    const storage = createMemoryStorage()
+    const emptyContract = '0x6969696969696969696969696969696969696969' as Address
+    const latestHash = `0x${'d'.repeat(64)}`
+    vi.stubGlobal('localStorage', storage)
+    try {
+      persistAnalyticsCache(storage, emptyContract, [])
+      const progress: Array<{ phase: string; totalReceipts: number }> = []
+      const client = {
+        getBlockNumber: vi.fn(() => Promise.resolve(25n)),
+        getBlock: vi.fn(({ blockNumber }: { blockNumber: bigint }) => Promise.resolve({
+          timestamp,
+          hash: blockNumber === 25n ? latestHash : blockHash,
+        })),
+        getBytecode: vi.fn(({ blockNumber }: { blockNumber: bigint }) =>
+          Promise.resolve(blockNumber >= 10n ? '0x6000' : '0x')),
+        getLogs: vi.fn(() => Promise.resolve([])),
+      } as unknown as PublicClient
+
+      await scanOnchainDistributions(client, {
+        chainId: 5042,
+        networkName: 'Arc Mainnet',
+        contractAddress: emptyContract,
+        payer,
+        onProgress: (item) => progress.push({
+          phase: item.phase,
+          totalReceipts: item.totalReceipts,
+        }),
+      })
+
+      expect(progress.some((item) => item.phase === 'revalidating')).toBe(false)
+      expect(progress.some((item) => item.phase === 'scanning')).toBe(true)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('discards a reorganized checkpoint and completes a full rescan before replacing it', async () => {
     const storage = createMemoryStorage()
     const reorgContract = '0x8888888888888888888888888888888888888888' as Address
@@ -463,10 +780,11 @@ describe('on-chain ArcSplit analytics', () => {
         payer,
         { chainId: 5042, networkName: 'Arc Mainnet', contractAddress: reorgContract },
       )
-      const key = `arcsplit:onchain-analytics:v1:5042:${reorgContract}:${payer}`
+      const key = `arcsplit:onchain-analytics:v2:5042:${reorgContract}:${payer}`
       storage.setItem(key, JSON.stringify({
-        version: 1,
+        version: 2,
         complete: true,
+        recordsPreviouslyReceiptVerified: true,
         chainId: 5042,
         contractAddress: reorgContract,
         payer,
@@ -524,10 +842,11 @@ describe('on-chain ArcSplit analytics', () => {
         payer,
         { chainId: 5042, networkName: 'Arc Mainnet', contractAddress: tamperedContract },
       )
-      const key = `arcsplit:onchain-analytics:v1:5042:${tamperedContract}:${payer}`
+      const key = `arcsplit:onchain-analytics:v2:5042:${tamperedContract}:${payer}`
       storage.setItem(key, JSON.stringify({
-        version: 1,
+        version: 2,
         complete: true,
+        recordsPreviouslyReceiptVerified: true,
         chainId: 5042,
         contractAddress: tamperedContract,
         payer,
@@ -639,6 +958,37 @@ describe('on-chain ArcSplit analytics', () => {
     )).rejects.toThrow(/no matching ArcSplit distribution event/i)
   })
 
+  it('rejects receipt verification for the retired Mainnet contract before RPC access', async () => {
+    const client = {
+      chain: { id: 5042 },
+      getTransaction: vi.fn(),
+      getTransactionReceipt: vi.fn(),
+    } as unknown as PublicClient
+    const savedEntry: SplitHistoryEntry = {
+      id: 'legacy-history-entry',
+      txHash,
+      chainId: 5042,
+      status: 'success',
+      contractAddress: ARCSPLIT_MAINNET_LEGACY_ADDRESS,
+      mode: 'fixed',
+      totalRaw: '1500000',
+      recipients: [
+        { address: alice, amountRaw: '1000000' },
+        { address: bob, amountRaw: '500000' },
+      ],
+      createdAt: Date.now(),
+    }
+
+    await expect(verifyHistoryDistributionReceipt(
+      client,
+      savedEntry,
+      payer,
+      'Arc Mainnet',
+    )).rejects.toThrow(/not a configured ArcSplit deployment/i)
+    expect(client.getTransaction).not.toHaveBeenCalled()
+    expect(client.getTransactionReceipt).not.toHaveBeenCalled()
+  })
+
   it('retries transient RPC failures and times out stalled requests without returning partial results', async () => {
     const address = '0x5555555555555555555555555555555555555555' as Address
     const getLogs = vi.fn()
@@ -673,14 +1023,238 @@ describe('on-chain ArcSplit analytics', () => {
       })
       const timedOutScan = expect(stalledScan).rejects.toThrow(/timed out after 12 seconds/i)
 
-      await vi.advanceTimersByTimeAsync(12_000)
-      await vi.advanceTimersByTimeAsync(250)
-      await vi.advanceTimersByTimeAsync(12_000)
-
+      await vi.runAllTimersAsync()
       await timedOutScan
-      expect(stalledClient.getBlockNumber).toHaveBeenCalledTimes(2)
+      expect(stalledClient.getBlockNumber).toHaveBeenCalledTimes(4)
     } finally {
       vi.useRealTimers()
+    }
+  })
+
+  it('respects Retry-After for rate-limited RPC requests', async () => {
+    const address = '0x5757575757575757575757575757575757575757' as Address
+    const rateLimitError = new HttpRequestError({
+      details: 'Rate limit exceeded.',
+      status: 429,
+      headers: new Headers({ 'Retry-After': '2' }),
+      url: 'https://rpc.arc.invalid',
+    })
+    const requestStartedAt: number[] = []
+    const getLogs = vi.fn(() => {
+      requestStartedAt.push(Date.now())
+      return requestStartedAt.length === 1
+        ? Promise.reject(rateLimitError)
+        : Promise.resolve([])
+    })
+    const client = {
+      getBlockNumber: vi.fn(async () => 10n),
+      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
+      getBytecode: vi.fn(async () => '0x6000' as Hex),
+      getLogs,
+    } as unknown as PublicClient
+
+    const result = await scanOnchainDistributions(client, {
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: address,
+      payer,
+    })
+
+    expect(result.coverage.scannedThroughBlock).toBe(10n)
+    expect(getLogs).toHaveBeenCalledTimes(2)
+    expect(requestStartedAt[1]! - requestStartedAt[0]!).toBeGreaterThanOrEqual(2_000)
+  })
+
+  it('treats the observed message with rate-limit details as a rate error, not a range error', async () => {
+    const address = '0x5959595959595959595959595959595959595959' as Address
+    const requests: Array<{ fromBlock: bigint; toBlock: bigint }> = []
+    const getLogs = vi.fn(({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
+      requests.push({ fromBlock, toBlock })
+      return requests.length === 1
+        ? Promise.reject({
+          message: 'Request exceeds defined limit',
+          details: 'rate limit exceeded',
+        })
+        : Promise.resolve([])
+    })
+    const client = {
+      getBlockNumber: vi.fn(async () => 10n),
+      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
+      getBytecode: vi.fn(async () => '0x6000' as Hex),
+      getLogs,
+    } as unknown as PublicClient
+
+    const result = await scanOnchainDistributions(client, {
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: address,
+      payer,
+    })
+
+    expect(result.coverage.scannedThroughBlock).toBe(10n)
+    expect(requests).toEqual([
+      { fromBlock: 0n, toBlock: 10n },
+      { fromBlock: 0n, toBlock: 10n },
+    ])
+  })
+
+  it('applies jittered exponential backoff and stops after the bounded retry limit', async () => {
+    const address = '0x5656565656565656565656565656565656565656' as Address
+    const rateLimitError = new HttpRequestError({
+      details: 'Rate limit exceeded.',
+      status: 429,
+      url: 'https://rpc.arc.invalid',
+    })
+    const getBlockNumber = vi.fn(() => Promise.reject(rateLimitError))
+    const client = {
+      getBlockNumber,
+    } as unknown as PublicClient
+
+    vi.useFakeTimers()
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+    try {
+      const scan = scanOnchainDistributions(client, {
+        chainId: 5042,
+        networkName: 'Arc Mainnet',
+        contractAddress: address,
+        payer,
+      })
+      const failure = expect(scan).rejects.toThrow(/HTTP request failed/i)
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(getBlockNumber).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(124)
+      expect(getBlockNumber).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(getBlockNumber).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(249)
+      expect(getBlockNumber).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(getBlockNumber).toHaveBeenCalledTimes(3)
+      await vi.advanceTimersByTimeAsync(499)
+      expect(getBlockNumber).toHaveBeenCalledTimes(3)
+      await vi.advanceTimersByTimeAsync(1)
+      await failure
+      expect(getBlockNumber).toHaveBeenCalledTimes(4)
+    } finally {
+      random.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries textual rate-limit errors without an HTTP status', async () => {
+    const address = '0x5858585858585858585858585858585858585858' as Address
+    const getBlockNumber = vi.fn()
+      .mockRejectedValueOnce(new Error('rate limit exceeded'))
+      .mockResolvedValueOnce(10n)
+    const client = {
+      getBlockNumber,
+      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
+      getBytecode: vi.fn(async () => '0x6000' as Hex),
+      getLogs: vi.fn(async () => []),
+    } as unknown as PublicClient
+
+    const result = await scanOnchainDistributions(client, {
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: address,
+      payer,
+    })
+
+    expect(result.coverage.scannedThroughBlock).toBe(10n)
+    expect(getBlockNumber).toHaveBeenCalledTimes(2)
+  })
+
+  it('serializes and paces concurrent contract log requests', async () => {
+    const storage = createMemoryStorage()
+    vi.stubGlobal('localStorage', storage)
+    const contractAddresses = Array.from({ length: 3 }, (_, index) =>
+      `0x${(index + 1).toString(16).padStart(40, '0')}` as Address,
+    )
+    let activeLogRequests = 0
+    let maxActiveLogRequests = 0
+    const logRequestStarts: number[] = []
+    const releaseLogRequests: Array<() => void> = []
+    const getLogs = vi.fn(() => new Promise<never[]>((resolve) => {
+      activeLogRequests += 1
+      maxActiveLogRequests = Math.max(maxActiveLogRequests, activeLogRequests)
+      logRequestStarts.push(Date.now())
+      releaseLogRequests.push(() => {
+        activeLogRequests -= 1
+        resolve([])
+      })
+    }))
+    const client = {
+      getBlockNumber: vi.fn(async () => 10n),
+      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
+      getBytecode: vi.fn(async () => '0x6000' as Hex),
+      getLogs,
+    } as unknown as PublicClient
+
+    try {
+      const scans = contractAddresses.map((contractAddress) =>
+        scanOnchainDistributions(client, {
+          chainId: 5042,
+          networkName: 'Arc Mainnet',
+          contractAddress,
+          payer,
+        }),
+      )
+
+      for (let index = 0; index < contractAddresses.length; index += 1) {
+        await vi.waitFor(() => expect(releaseLogRequests).toHaveLength(1))
+        const release = releaseLogRequests.shift()
+        if (!release) throw new Error('Expected one throttled log request to be pending.')
+        release()
+      }
+      await Promise.all(scans)
+
+      expect(getLogs).toHaveBeenCalledTimes(3)
+      expect(maxActiveLogRequests).toBe(1)
+      for (let index = 1; index < logRequestStarts.length; index += 1) {
+        expect(logRequestStarts[index]! - logRequestStarts[index - 1]!).toBeGreaterThanOrEqual(250)
+      }
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  }, 20_000)
+
+  it('logs redacted RPC method, contract, range, duration, and failure diagnostics', async () => {
+    const diagnosticContract = '0x7777777777777777777777777777777777777777' as Address
+    const privatePayload = `0x${'a'.repeat(64)}`
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.stubEnv('DEV', true)
+    try {
+      const client = {
+        getBlockNumber: vi.fn(() => Promise.resolve(10n)),
+        getBlock: vi.fn(() => Promise.resolve({ timestamp, hash: blockHash })),
+        getBytecode: vi.fn(({ blockNumber }: { blockNumber: bigint }) =>
+          Promise.resolve(blockNumber >= 5n ? '0x6000' : '0x')),
+        getLogs: vi.fn(() => Promise.reject(new Error(`RPC failed for ${privatePayload}`))),
+      } as unknown as PublicClient
+
+      await expect(scanOnchainDistributions(client, {
+        chainId: 5042,
+        networkName: 'Arc Mainnet',
+        contractAddress: diagnosticContract,
+        payer,
+      })).rejects.toThrow(/could not scan ArcSplit event logs/i)
+
+      expect(warn).toHaveBeenCalledWith('[ArcSplit analytics RPC]', expect.objectContaining({
+        method: 'eth_getLogs',
+        contractAddress: diagnosticContract,
+        fromBlock: '5',
+        toBlock: '10',
+        attempt: 1,
+        durationMs: expect.any(Number),
+        error: expect.stringContaining('[REDACTED]'),
+      }))
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(privatePayload)
+    } finally {
+      debug.mockRestore()
+      warn.mockRestore()
+      vi.unstubAllEnvs()
     }
   })
 
@@ -688,8 +1262,10 @@ describe('on-chain ArcSplit analytics', () => {
     const address = '0x5555555555555555555555555555555555555555' as Address
     const storage = createMemoryStorage()
     vi.stubGlobal('localStorage', storage)
-    const cacheKey = `arcsplit:onchain-analytics:v1:5042002:${address}:${payer}`
+    const cacheKey = `arcsplit:onchain-analytics:v2:5042002:${address}:${payer}`
     const getLogs = vi.fn()
+      .mockRejectedValueOnce(new Error('historical log service unavailable'))
+      .mockRejectedValueOnce(new Error('historical log service unavailable'))
       .mockRejectedValueOnce(new Error('historical log service unavailable'))
       .mockRejectedValueOnce(new Error('historical log service unavailable'))
       .mockResolvedValueOnce([])
@@ -710,12 +1286,15 @@ describe('on-chain ArcSplit analytics', () => {
       await expect(scanOnchainDistributions(client, options))
         .rejects.toThrow(/could not scan ArcSplit event logs/i)
       expect(storage.getItem(cacheKey)).toBeNull()
-      expect(getLogs).toHaveBeenCalledTimes(2)
+      expect(getLogs).toHaveBeenCalledTimes(4)
 
       const recovered = await scanOnchainDistributions(client, options)
       expect(recovered.coverage.scannedThroughBlock).toBe(10n)
-      expect(storage.getItem(cacheKey)).not.toBeNull()
-      expect(getLogs).toHaveBeenCalledTimes(3)
+      const persistedCache = storage.getItem(cacheKey)
+      expect(persistedCache).not.toBeNull()
+      if (persistedCache === null) throw new Error('Expected the verified scan checkpoint to be persisted.')
+      expect(JSON.parse(persistedCache)).not.toHaveProperty('recordsPreviouslyReceiptVerified')
+      expect(getLogs).toHaveBeenCalledTimes(5)
     } finally {
       vi.unstubAllGlobals()
     }

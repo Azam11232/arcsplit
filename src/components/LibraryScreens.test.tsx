@@ -117,12 +117,22 @@ beforeEach(() => {
     retry: vi.fn(),
     network: {
       name: 'Arc Mainnet',
-      analyticsContractAddresses: ['0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E'],
+      analyticsContractAddresses: [activeMainnetContract],
     },
   })
 })
 
 afterEach(cleanup)
+
+describe('Analytics screen storage startup', () => {
+  it('loads combined library storage once when Analytics mounts', () => {
+    const getItem = vi.spyOn(globalThis.localStorage, 'getItem')
+
+    render(<AnalyticsScreen />)
+
+    expect(getItem).toHaveBeenCalledTimes(1)
+  })
+})
 
 describe('Saved recipients screen', () => {
   it('adds, reuses, and removes recipients independently', () => {
@@ -229,7 +239,7 @@ describe('History screen', () => {
       refresh: vi.fn(),
       network: {
         name: 'Arc Mainnet',
-        analyticsContractAddresses: ['0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E'],
+        analyticsContractAddresses: [activeMainnetContract],
       },
     })
 
@@ -274,31 +284,25 @@ describe('History screen', () => {
     expect(monthRange).toHaveProperty('value', 'month')
   })
 
-  it('renders the full previously verified analytics snapshot while an incremental scan runs', () => {
-    const createdAt = Date.now()
-    const refresh = vi.fn()
-    const incompleteMonth = new Date(Date.UTC(
-      new Date(createdAt).getUTCFullYear(),
-      new Date(createdAt).getUTCMonth() - 2,
-      1,
-    )).toISOString().slice(0, 7)
-    const snapshot = {
-      records: [confirmedDistribution(`0x${'8'.repeat(64)}`, createdAt)],
-      coverage: {
-        deploymentBlock: 1n,
-        deploymentTimestamp: Date.UTC(
-          new Date(createdAt).getUTCFullYear(),
-          new Date(createdAt).getUTCMonth() - 2,
-          1,
-        ),
-        scannedThroughBlock: 100n,
-        expectedContractCount: 2,
-      },
+  it.each([
+    ['retained', true],
+    ['changed', false],
+  ])('hides tampered cached financial values with a %s provenance marker', (_markerChange, marker) => {
+    const tamperedRecord = {
+      ...confirmedDistribution(`0x${'8'.repeat(64)}`),
+      totalRaw: '9000000',
+      recipients: [{ address: alice, amountRaw: '9000000' }],
+      verificationStatus: 'unverified' as const,
     }
+    const snapshot = Object.assign({
+      records: [tamperedRecord],
+      coverage: { deploymentBlock: 1n, scannedThroughBlock: 100n },
+    }, { recordsPreviouslyReceiptVerified: marker })
     mocks.onchainAnalytics.mockReturnValue({
       state: {
         status: 'loading',
         contextKey: 'mainnet-wallet',
+        contracts: [],
         progress: {
           phase: 'scanning',
           fromBlock: 101n,
@@ -311,31 +315,258 @@ describe('History screen', () => {
         snapshot,
       },
       retry: vi.fn(),
-      refresh,
+      refresh: vi.fn(),
       network: {
         name: 'Arc Mainnet',
-        analyticsContractAddresses: ['0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E'],
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+
+    const { container } = render(<AnalyticsScreen />)
+
+    expect(screen.getByText('Stale cached snapshot · untrusted')).toBeTruthy()
+    expect(screen.getByText(/Browser storage cannot authenticate cached analytics/)).toBeTruthy()
+    expect(container.querySelectorAll('.animate-pulse')).toHaveLength(4)
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
+    expect(screen.queryByText('9.00 USDC')).toBeNull()
+    expect(screen.queryByRole('group', { name: /Daily Distributions/ })).toBeNull()
+    expect(screen.queryByLabelText('Chart month')).toBeNull()
+    expect(tamperedRecord.verificationStatus).toBe('unverified')
+  })
+
+  it('shows cached receipt revalidation progress separately from event scanning', () => {
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'revalidating',
+          blocksScanned: 0n,
+          totalBlocks: 0n,
+          receiptsChecked: 25,
+          totalReceipts: 100,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
       },
     })
 
     render(<AnalyticsScreen />)
 
-    expect(screen.getByText('Previously verified snapshot')).toBeTruthy()
-    expect(within(screen.getByLabelText('Chart month')).queryByRole('option', {
-      name: formatUtcMonthLabel(incompleteMonth),
-    })).toBeNull()
-    expect(screen.getByText('Total USDC distributed').closest('article')?.textContent).toContain('1.00 USDC')
-    const dateLabel = formatUtcDayLabel(new Date(createdAt).toISOString().slice(0, 10))
-    const monthLabel = formatUtcMonthLabel(new Date(createdAt).toISOString().slice(0, 7))
-    const dailyChart = screen.getByRole('group', { name: `Daily Distributions · ${monthLabel} daily chart` })
-    expect(within(dailyChart).getByRole('img', { name: `${dateLabel}: 1.00 USDC verified` })).toBeTruthy()
-    expect(screen.getByRole('option', { name: 'Monthly' })).toHaveProperty('selected', true)
-    expect(screen.getByRole('option', { name: 'Custom' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Full rescan' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    expect(refresh).toHaveBeenCalledOnce()
-    expect(screen.getByText('Cached verified distributions')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Payment analytics' })).toBeTruthy()
+    expect(screen.getByText('Revalidating cached transactions')).toBeTruthy()
+    expect(screen.getByText(/Revalidating cached receipts: 25 of 100/)).toBeTruthy()
+    expect(screen.getByRole('progressbar', { name: 'Receipts verified: 25 of 100' }).getAttribute('aria-valuenow')).toBe('25')
+    expect(screen.queryByText('Scanning ArcSplit distribution events…')).toBeNull()
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
+    expect(screen.getByText('25%')).toBeTruthy()
   })
+
+  it('shows receipt verification progress instead of completed block progress', () => {
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'verifying',
+          blocksScanned: 10_000n,
+          totalBlocks: 10_000n,
+          receiptsChecked: 25,
+          totalReceipts: 100,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+
+    const { rerender } = render(<AnalyticsScreen />)
+
+    expect(screen.getByText('Verifying on-chain transactions')).toBeTruthy()
+    expect(screen.getByText(/Verifying 25 of 100 transaction receipts/)).toBeTruthy()
+    expect(screen.getByRole('progressbar', { name: 'Receipts verified: 25 of 100' }).getAttribute('aria-valuenow')).toBe('25')
+    expect(screen.queryByText('100%')).toBeNull()
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
+
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'verifying',
+          blocksScanned: 10_000n,
+          totalBlocks: 10_000n,
+          receiptsChecked: 100,
+          totalReceipts: 100,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+    rerender(<AnalyticsScreen />)
+
+    expect(screen.getByText('Confirming on-chain checkpoint')).toBeTruthy()
+    expect(screen.getByText(/confirming canonical chain checkpoints/)).toBeTruthy()
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
+  })
+
+  it('shows block progress only while scanning and omits unavailable progress', () => {
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'scanning',
+          blocksScanned: 5_000n,
+          totalBlocks: 10_000n,
+          receiptsChecked: 0,
+          totalReceipts: 0,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+
+    const view = render(<AnalyticsScreen />)
+
+    expect(screen.getByText('Scanning on-chain activity')).toBeTruthy()
+    expect(screen.getByRole('progressbar', { name: 'Blocks scanned: 5000 of 10000' }).getAttribute('aria-valuenow')).toBe('50')
+
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'discovering',
+          blocksScanned: 0n,
+          totalBlocks: 0n,
+          receiptsChecked: 0,
+          totalReceipts: 0,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+    view.rerender(<AnalyticsScreen />)
+
+    expect(screen.getByText('Preparing on-chain analytics')).toBeTruthy()
+    expect(screen.getByText(/Finding the contract deployment block/)).toBeTruthy()
+    expect(screen.queryByRole('progressbar')).toBeNull()
+  })
+
+  it('does not use unauthenticated cached records for financial totals', () => {
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'error',
+        contextKey: 'mainnet-wallet',
+        message: 'historical RPC unavailable',
+        snapshot: {
+          records: [{
+            ...confirmedDistribution(`0x${'2'.repeat(64)}`),
+            verificationStatus: 'unverified',
+          }],
+          coverage: { deploymentBlock: 1n, scannedThroughBlock: 90n },
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+
+    render(<AnalyticsScreen />)
+
+    expect(screen.getByText(/Browser storage cannot authenticate cached analytics/)).toBeTruthy()
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
+    expect(screen.getByRole('heading', {
+      name: 'Stale cached snapshot · untrusted',
+    })).toBeTruthy()
+    expect(screen.queryByRole('group', { name: /Daily Distributions/ })).toBeNull()
+  })
+
+  it('labels partial contract analytics clearly instead of as complete', () => {
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'partial',
+        contextKey: 'mainnet-wallet',
+        records: [confirmedDistribution(`0x${'9'.repeat(64)}`)],
+        deploymentBlock: 1n,
+        scannedThroughBlock: 100n,
+        warning: 'Verified results from 1 of 2 configured contracts. Still scanning: 0xF13199D9bbf965eE10f41b531Ee4aa660bB54738.',
+        progress: {
+          phase: 'revalidating',
+          blocksScanned: 0n,
+          totalBlocks: 0n,
+          receiptsChecked: 2,
+          totalReceipts: 5,
+        },
+        contracts: [
+          {
+            contractAddress: '0x4444444444444444444444444444444444444444',
+            status: 'verified',
+          },
+          {
+            contractAddress: '0xF13199D9bbf965eE10f41b531Ee4aa660bB54738',
+            status: 'scanning',
+            progress: {
+              phase: 'revalidating',
+              blocksScanned: 0n,
+              totalBlocks: 0n,
+              receiptsChecked: 2,
+              totalReceipts: 5,
+            },
+          },
+        ],
+        isScanning: true,
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [
+          '0x4444444444444444444444444444444444444444',
+          '0xF13199D9bbf965eE10f41b531Ee4aa660bB54738',
+        ],
+      },
+    })
+
+    render(<AnalyticsScreen />)
+
+    expect(screen.getByRole('alert').textContent).toContain('Partial verified results')
+    expect(screen.getByRole('alert').textContent).toContain('Still scanning')
+    expect(screen.getByText('Contract scan status')).toBeTruthy()
+    expect(screen.getByText(/Revalidating cached receipts: 2 of 5/)).toBeTruthy()
+    expect(screen.getByText('0xF13199D9bbf965eE10f41b531Ee4aa660bB54738')).toBeTruthy()
+    expect(screen.getByText(/across 1 of 2 contracts/)).toBeTruthy()
+    expect(screen.getByText('Total USDC distributed').closest('article')?.textContent).toContain('1.00 USDC')
+  })
+
   it('shows an empty state when there are no confirmed payments', () => {
     render(<HistoryScreen />)
     expect(screen.getByText('No saved transactions yet')).toBeTruthy()
@@ -378,8 +609,8 @@ describe('History screen', () => {
     const account = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     const mainnet = getArcNetwork(ARC_MAINNET_CHAIN_ID)
     expect(activeMainnetContract).toBe(ARCSPLIT_MAINNET_NEXT_ADDRESS)
-    expect(mainnet?.analyticsContractAddresses).toContain(ARCSPLIT_MAINNET_LEGACY_ADDRESS)
-    expect(mainnet?.analyticsContractAddresses).toContain(ARCSPLIT_MAINNET_NEXT_ADDRESS)
+    expect(mainnet?.analyticsContractAddresses).toEqual([ARCSPLIT_MAINNET_NEXT_ADDRESS])
+    expect(mainnet?.analyticsContractAddresses).not.toContain(ARCSPLIT_MAINNET_LEGACY_ADDRESS)
 
     addHistoryEntry(account, ARC_MAINNET_CHAIN_ID, {
       txHash: `0x${'a'.repeat(64)}`,
@@ -421,6 +652,25 @@ describe('History screen', () => {
     expect(storedHistory).toHaveLength(3)
     expect(storedHistory.some((entry) => entry.contractAddress === ARCSPLIT_MAINNET_LEGACY_ADDRESS)).toBe(true)
     expect(storedHistory.some((entry) => entry.contractAddress === undefined)).toBe(true)
+  })
+
+  it('keeps retired Mainnet history stored but excludes it from Analytics local-only results', () => {
+    const account = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const retiredTxHash = `0x${'d'.repeat(64)}` as `0x${string}`
+    addHistoryEntry(account, ARC_MAINNET_CHAIN_ID, {
+      txHash: retiredTxHash,
+      chainId: ARC_MAINNET_CHAIN_ID,
+      contractAddress: ARCSPLIT_MAINNET_LEGACY_ADDRESS,
+      status: 'success',
+      mode: 'fixed',
+      totalRaw: '2000000',
+      recipients: [{ address: bob, amountRaw: '2000000' }],
+    })
+
+    render(<AnalyticsScreen />)
+
+    expect(screen.queryByText(retiredTxHash)).toBeNull()
+    expect(getHistory(account, ARC_MAINNET_CHAIN_ID)).toHaveLength(1)
   })
 
   it('keeps Testnet History scoped to the Testnet active contract and wallet network', () => {
@@ -506,7 +756,7 @@ describe('History screen', () => {
       refresh,
       network: {
         name: 'Arc Mainnet',
-        analyticsContractAddresses: ['0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E'],
+        analyticsContractAddresses: [activeMainnetContract],
       },
     })
     addHistoryEntry('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 5042, {
@@ -586,14 +836,17 @@ describe('History screen', () => {
         contextKey: 'mainnet-wallet',
         message: 'historical RPC unavailable',
         snapshot: {
-          records: [confirmedDistribution(`0x${'7'.repeat(64)}`)],
+          records: [{
+            ...confirmedDistribution(`0x${'7'.repeat(64)}`),
+            verificationStatus: 'unverified',
+          }],
           coverage: { deploymentBlock: 1n, scannedThroughBlock: 90n },
         },
       },
       retry,
       network: {
         name: 'Arc Mainnet',
-        analyticsContractAddresses: ['0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E'],
+        analyticsContractAddresses: [activeMainnetContract],
       },
     })
     addHistoryEntry('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 5042, {
@@ -608,14 +861,17 @@ describe('History screen', () => {
     render(<AnalyticsScreen />)
 
     expect(screen.getByText('On-chain analytics could not be completed')).toBeTruthy()
-    expect(screen.getByText('Previously verified snapshot')).toBeTruthy()
-    expect(screen.getByText(/latest update failed; this snapshot may omit newer blocks/i)).toBeTruthy()
+    expect(screen.getByText('Stale cached snapshot · untrusted')).toBeTruthy()
+    expect(screen.getByText(/Browser storage cannot authenticate cached analytics/)).toBeTruthy()
+    expect(screen.getByText(/latest update failed; cached financial values remain hidden/i)).toBeTruthy()
     expect(screen.getByText('Saved records · not verified')).toBeTruthy()
     expect(screen.getByText(/cannot yet be matched against the chain/i)).toBeTruthy()
     expect(screen.queryByRole('group', { name: 'Verified daily distributions, last 7 UTC days' })).toBeNull()
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     expect(retry).toHaveBeenCalledOnce()
-    expect(screen.getByText('Total USDC distributed')).toBeTruthy()
+    expect(screen.getByText(/cached financial values remain hidden/i)).toBeTruthy()
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
   })
 
   it('shows a clear missing-data state with explicit zero-activity chart periods', () => {
@@ -691,7 +947,7 @@ describe('History screen', () => {
       refresh: vi.fn(),
       network: {
         name: 'Arc Mainnet',
-        analyticsContractAddresses: ['0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E'],
+        analyticsContractAddresses: [activeMainnetContract],
       },
     })
 
@@ -745,7 +1001,7 @@ describe('History screen', () => {
       rescan: vi.fn(),
       network: {
         name: 'Arc Mainnet',
-        analyticsContractAddresses: ['0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E'],
+        analyticsContractAddresses: [activeMainnetContract],
       },
     })
 
@@ -806,7 +1062,7 @@ describe('History screen', () => {
         name: chainId === 5042 ? 'Arc Mainnet' : 'Arc Testnet',
         analyticsContractAddresses: [
           chainId === 5042
-            ? '0xB7Ee9d819AA626F3ABA56ab3948bC56fa62f0E7E'
+            ? activeMainnetContract
             : '0x0c4DC391c39641B5DEa9304454B99B37c9FFFb35',
         ],
       },
