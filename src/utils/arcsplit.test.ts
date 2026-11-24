@@ -47,8 +47,9 @@ describe('ArcSplit network contract configuration', () => {
       const testnet = getFreshArcNetwork(ARC_TESTNET_CHAIN_ID)
 
       expect(mainnet?.contractAddress).toBe(nextMainnetAddress)
-      expect(mainnet?.analyticsContractAddresses).toContain(ARCSPLIT_MAINNET_LEGACY_ADDRESS)
-      expect(mainnet?.analyticsContractAddresses).toContain(nextMainnetAddress)
+      expect(mainnet?.analyticsContractAddresses).toEqual([nextMainnetAddress])
+      expect(mainnet?.analyticsContractAddresses).not.toContain(ARCSPLIT_MAINNET_LEGACY_ADDRESS)
+      expect(mainnet?.analyticsContractAddresses).not.toContain(activeMainnetAddress)
       expect(testnet?.contractAddress).toBe(testnetAddress)
       expect(testnet?.analyticsContractAddresses).toEqual([testnetAddress])
       expect(testnet?.analyticsContractAddresses).not.toContain(activeMainnetAddress)
@@ -59,13 +60,13 @@ describe('ArcSplit network contract configuration', () => {
     }
   })
 
-  it('keeps the active Mainnet spender unchanged and includes its historical analytics address', () => {
+  it('tracks only the current Mainnet contract for Analytics', () => {
     const mainnet = getArcNetwork(ARC_MAINNET_CHAIN_ID)
     expect(mainnet?.contractAddress).toBe(ARCSPLIT_MAINNET_NEXT_ADDRESS)
     expect(mainnet?.contractAddress).toBe('0xF13199D9bbf965eE10f41b531Ee4aa660bB54738')
-    expect(mainnet?.analyticsContractAddresses).toContain(ARCSPLIT_MAINNET_LEGACY_ADDRESS)
-    if (ARCSPLIT_ADDRESS) expect(mainnet?.analyticsContractAddresses).toContain(ARCSPLIT_ADDRESS)
-    expect(mainnet?.analyticsContractAddresses).toContain(ARCSPLIT_MAINNET_NEXT_ADDRESS)
+    expect(mainnet?.analyticsContractAddresses).toEqual([ARCSPLIT_MAINNET_NEXT_ADDRESS])
+    expect(mainnet?.analyticsContractAddresses).not.toContain(ARCSPLIT_MAINNET_LEGACY_ADDRESS)
+    expect(mainnet?.analyticsContractAddresses).not.toContain(ARCSPLIT_ADDRESS)
   })
 
   it('always uses F131 as the Mainnet transaction target regardless of legacy environment flags', async () => {
@@ -81,7 +82,7 @@ describe('ArcSplit network contract configuration', () => {
         await import('./arcsplit')
       const mainnet = getFreshArcNetwork(mainnetChainId)
       expect(mainnet?.contractAddress).toBe(nextAddress)
-      expect(mainnet?.analyticsContractAddresses).toEqual([activeAddress, nextAddress])
+      expect(mainnet?.analyticsContractAddresses).toEqual([nextAddress])
     } finally {
       vi.unstubAllEnvs()
       vi.resetModules()

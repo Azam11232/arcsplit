@@ -96,11 +96,7 @@ const arcNetworks: Record<number, ArcNetwork> = {
     usdcAddress: mainnetUsdc.address as `0x${string}`,
     usdcDecimals: mainnetUsdc.decimals,
     contractAddress: mainnetTransactionAddress,
-    analyticsContractAddresses: uniqueAddresses([
-      ARCSPLIT_MAINNET_LEGACY_ADDRESS,
-      ARCSPLIT_ADDRESS,
-      ARCSPLIT_MAINNET_NEXT_ADDRESS,
-    ]),
+    analyticsContractAddresses: uniqueAddresses([ARCSPLIT_MAINNET_NEXT_ADDRESS]),
     explorerBase: requireChain(ARC_MAINNET_CHAIN_ID).explorerBase,
   },
   [ARC_TESTNET_CHAIN_ID]: {

@@ -36,9 +36,7 @@ import {
 } from '@/utils/arcsplit'
 import type { Recipient } from '@/utils/arcsplit'
 import {
-  getHistory,
-  getSavedRecipients,
-  getTemplates,
+  getSplitStorageData,
   removeSavedRecipient,
   removeTemplate,
   saveRecipient,
@@ -56,6 +54,7 @@ import {
 } from '@/utils/analytics'
 import type { AnalyticsDateRange, DistributionBucket } from '@/utils/analytics'
 import { useOnchainAnalytics } from '@/hooks/useOnchainAnalytics'
+import type { OnchainContractScanState } from '@/hooks/useOnchainAnalytics'
 import { mergeOnchainAndLocalHistory } from '@/utils/onchainAnalytics'
 import type {
   LocalOnlyDistribution,
@@ -76,30 +75,37 @@ interface LibraryData {
   history: SplitHistoryEntry[]
 }
 
+const EMPTY_ANALYTICS_RECORDS: OnchainDistributionRecord[] = []
+
 function useLibraryData(): LibraryData {
   const { address: accountAddress, chainId } = useAccount()
   const contextKey = `${accountAddress?.toLowerCase() ?? 'disconnected'}:${chainId ?? 'unsupported'}`
+  const [initialData] = useState(() => getSplitStorageData(accountAddress, chainId))
   const [savedRecipients, setSavedRecipients] = useState<SavedRecipient[]>(
-    () => getSavedRecipients(accountAddress, chainId),
+    initialData.recipients,
   )
   const [templates, setTemplates] = useState<SplitTemplate[]>(
-    () => getTemplates(accountAddress, chainId),
+    initialData.templates,
   )
   const [history, setHistory] = useState<SplitHistoryEntry[]>(
-    () => getHistory(accountAddress, chainId),
+    initialData.history,
   )
   const [loadedContext, setLoadedContext] = useState(contextKey)
   const network = getArcNetwork(chainId)
 
   const reload = useCallback(() => {
-    setSavedRecipients(getSavedRecipients(accountAddress, chainId))
-    setTemplates(getTemplates(accountAddress, chainId))
-    setHistory(getHistory(accountAddress, chainId))
+    const data = getSplitStorageData(accountAddress, chainId)
+    setSavedRecipients(data.recipients)
+    setTemplates(data.templates)
+    setHistory(data.history)
     setLoadedContext(contextKey)
   }, [accountAddress, chainId, contextKey])
 
   useEffect(() => {
-    reload()
+    if (loadedContext !== contextKey) reload()
+  }, [contextKey, loadedContext, reload])
+
+  useEffect(() => {
     window.addEventListener('storage', reload)
     return () => window.removeEventListener('storage', reload)
   }, [reload])
@@ -1052,32 +1058,29 @@ function DistributionChart({
 
 function AnalyticsLoading({
   progress,
+  contracts,
   networkName,
   snapshot,
   cacheWarning,
   refresh,
-  dateRange,
-  dateRangeError,
-  chartMonthControls,
-  ...rangeControls
 }: {
   progress: OnchainScanProgress
+  contracts: OnchainContractScanState[]
   networkName: string | undefined
   snapshot?: OnchainScanResult
   cacheWarning?: string
   refresh: () => void
-  dateRange: AnalyticsDateRange
-  dateRangeError: boolean
-  chartMonthControls: AnalyticsChartMonthControlsProps
-} & AnalyticsRangeControlsProps) {
+}) {
   const percentage = progress.totalBlocks > 0n
     ? Math.min(100, Number((progress.blocksScanned * 100n) / progress.totalBlocks))
     : undefined
   const phaseLabel = progress.phase === 'discovering'
     ? 'Finding the contract deployment block…'
-    : progress.phase === 'scanning'
-      ? 'Scanning ArcSplit distribution events…'
-      : `Verifying ${progress.receiptsChecked} of ${progress.totalReceipts} transaction receipts…`
+    : progress.phase === 'revalidating'
+      ? `Revalidating cached receipts: ${progress.receiptsChecked} of ${progress.totalReceipts}…`
+      : progress.phase === 'scanning'
+        ? 'Scanning ArcSplit distribution events…'
+        : `Verifying ${progress.receiptsChecked} of ${progress.totalReceipts} transaction receipts…`
 
   return (
     <div className="space-y-4">
@@ -1112,14 +1115,9 @@ function AnalyticsLoading({
         </div>
       )}
       {snapshot && (
-        <CachedAnalyticsSnapshot
-          snapshot={snapshot}
-          dateRange={dateRange}
-          dateRangeError={dateRangeError}
-          chartMonthControls={chartMonthControls}
-          {...rangeControls}
-        />
+        <StaleCacheNotice />
       )}
+      <ContractScanStatusList contracts={contracts} />
       {cacheWarning && (
         <p role="status" className="rounded-xl p-3 text-xs" style={{ color: 'var(--muted)', background: 'var(--surface-muted)' }}>
           {cacheWarning}
@@ -1138,6 +1136,59 @@ function AnalyticsLoading({
         </>
       )}
     </div>
+  )
+}
+
+function contractPhaseLabel(progress: OnchainScanProgress | undefined): string {
+  if (!progress) return 'Waiting to start'
+  if (progress.phase === 'discovering') return 'Finding deployment block'
+  if (progress.phase === 'revalidating') {
+    return `Revalidating cached receipts: ${progress.receiptsChecked} of ${progress.totalReceipts}`
+  }
+  if (progress.phase === 'scanning') {
+    return `Scanning events: ${progress.blocksScanned.toString()} of ${progress.totalBlocks.toString()} blocks`
+  }
+  return `Verifying receipts: ${progress.receiptsChecked} of ${progress.totalReceipts}`
+}
+
+function ContractScanStatusList({ contracts }: { contracts: OnchainContractScanState[] }) {
+  if (contracts.length === 0) return null
+
+  return (
+    <section
+      role="status"
+      aria-live="polite"
+      className="space-y-2 rounded-2xl p-4"
+      style={{ background: 'var(--surface-muted)', border: '1px solid var(--border)' }}
+    >
+      <h2 className="text-xs font-semibold" style={{ color: 'var(--ink)' }}>Contract scan status</h2>
+      <ul className="space-y-2">
+        {contracts.map((contract) => (
+          <li key={contract.contractAddress} className="rounded-xl p-3" style={{ background: 'var(--surface)' }}>
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <code className="break-all text-[11px]" style={{ color: 'var(--muted)' }}>{contract.contractAddress}</code>
+              <span className="text-[11px] font-semibold" style={{ color: contract.status === 'failed' ? 'var(--danger)' : 'var(--ink)' }}>
+                {contract.status === 'pending'
+                  ? 'Pending'
+                  : contract.status === 'scanning'
+                    ? 'In progress'
+                    : contract.status === 'verified'
+                      ? 'Verified'
+                      : 'Failed'}
+              </span>
+            </div>
+            {contract.status === 'scanning' && (
+              <p className="mt-1 text-[11px]" style={{ color: 'var(--muted)' }}>
+                {contractPhaseLabel(contract.progress)}
+              </p>
+            )}
+            {contract.status === 'failed' && contract.error && (
+              <p className="mt-1 break-words text-[11px]" style={{ color: 'var(--danger)' }}>{contract.error}</p>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
   )
 }
 
@@ -1241,86 +1292,20 @@ function RecentOnchainDistributions({ records, title = 'Recent confirmed distrib
   )
 }
 
-function CachedAnalyticsSnapshot({
-  snapshot,
+function StaleCacheNotice({
   updateFailed = false,
-  dateRange,
-  dateRangeError,
-  chartMonthControls,
-  ...rangeControls
 }: {
-  snapshot: OnchainScanResult
   updateFailed?: boolean
-  dateRange: AnalyticsDateRange
-  dateRangeError: boolean
-  chartMonthControls: AnalyticsChartMonthControlsProps
-} & AnalyticsRangeControlsProps) {
-  const cachedAnalytics = dateRangeError
-    ? undefined
-    : calculateSplitAnalytics(snapshot.records, dateRange)
-  const chartBuckets = buildAnalyticsChartBuckets(snapshot.records, chartMonthControls.selectedMonth)
-  const chartPresentation = analyticsChartPresentation(chartMonthControls.selectedMonth)
+}) {
   return (
     <section className="rounded-2xl p-4 sm:p-5" style={{ background: 'var(--info-surface)', border: '1px solid var(--info-border)' }}>
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="text-sm font-semibold" style={{ color: 'var(--ink)' }}>Previously verified snapshot</h2>
-        <span className="text-[11px] font-medium" style={{ color: 'var(--muted)' }}>
-          {snapshot.records.length} distribution{snapshot.records.length === 1 ? '' : 's'} · through block {snapshot.coverage.scannedThroughBlock.toString()}
-          {snapshot.coverage.expectedContractCount !== undefined
-            ? ` · ${snapshot.coverage.contracts?.length ?? 0}/${snapshot.coverage.expectedContractCount} contract caches`
-            : ''}
-        </span>
-      </div>
-      <p className="mt-1 text-xs leading-relaxed" style={{ color: 'var(--muted)' }}>
-        {cachedAnalytics ? `${formatUsdc(cachedAnalytics.totalRaw)} USDC from receipt-verified events. ` : ''}{updateFailed
-          ? 'The latest update failed; this snapshot may omit newer blocks.'
-          : 'An update is in progress; this snapshot does not include blocks scanned afterward.'}
+      <h2 className="text-sm font-semibold" style={{ color: 'var(--ink)' }}>Stale cached snapshot · untrusted</h2>
+      <p role="status" className="mt-1 text-xs leading-relaxed" style={{ color: 'var(--muted)' }}>
+        Browser storage cannot authenticate cached analytics and its contents may have been modified. Totals, recipient amounts, and charts are hidden until an RPC scan validates the receipts and checkpoint.
+        {' '}{updateFailed
+          ? 'The latest update failed; cached financial values remain hidden.'
+          : 'An RPC update is in progress; cached financial values remain hidden until verification completes.'}
       </p>
-      <div className="mt-4">
-        <AnalyticsRangeControls {...rangeControls} />
-      </div>
-      {dateRangeError ? (
-        <p role="alert" className="mt-3 rounded-xl p-3 text-xs" style={{ color: 'var(--danger)', background: 'var(--danger-surface)' }}>
-          The start date must be on or before the end date.
-        </p>
-      ) : cachedAnalytics && (
-        <>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            <MetricCard
-              label="Total USDC distributed"
-              value={`${formatUsdc(cachedAnalytics.totalRaw)} USDC`}
-              description="Previously verified on-chain payouts"
-              icon={ArrowUpRight}
-              tone="accent"
-              prominent
-            />
-            <MetricCard
-              label="Confirmed distributions"
-              value={String(cachedAnalytics.successfulCount)}
-              description="Previously verified receipts in this range"
-              icon={CheckCircle2}
-              tone="success"
-            />
-            <MetricCard
-              label="Average payment"
-              value={formatAveragePayment(cachedAnalytics.averageRaw)}
-              description="Average of verified distributions in this range"
-              icon={BarChart3}
-            />
-          </div>
-        </>
-      )}
-      <div className="analytics-distribution-charts mt-4 grid w-full min-w-0 gap-4">
-        <DistributionChart
-          title={chartPresentation.title}
-          description={chartPresentation.description}
-          buckets={chartBuckets}
-          {...chartMonthControls}
-        />
-      </div>
-      <div className="mt-3">
-        <RecentOnchainDistributions records={snapshot.records} title="Cached verified distributions" />
-      </div>
     </section>
   )
 }
@@ -1387,21 +1372,20 @@ export function AnalyticsScreen() {
     onEndDateChange: setEndDate,
   }
   const walletReady = hasActiveWallet(accountAddress, chainId)
-  const onchainRecords = onchainState.status === 'ready' ? onchainState.records : []
+  const expectedContractCount = network?.analyticsContractAddresses.length ?? 1
+  const verifiedContractCount = onchainState.status === 'partial'
+    ? onchainState.contracts.filter((contract) => contract.status === 'verified').length
+    : expectedContractCount
+  const onchainRecords = onchainState.status === 'ready' || onchainState.status === 'partial'
+    ? onchainState.records
+    : EMPTY_ANALYTICS_RECORDS
   const cachedSnapshot = onchainState.status === 'loading' || onchainState.status === 'error'
     ? onchainState.snapshot
     : undefined
-  const displayRecords = onchainState.status === 'ready'
-    ? onchainState.records
-    : cachedSnapshot?.records ?? []
-  const cachedCoverage = cachedSnapshot?.coverage
-  const cachedCoverageIsComplete = cachedCoverage?.expectedContractCount !== undefined
-    && (cachedCoverage.contracts?.length ?? 0) >= cachedCoverage.expectedContractCount
-  const deploymentTimestamp = onchainState.status === 'ready'
+  const displayRecords = onchainRecords
+  const deploymentTimestamp = onchainState.status === 'ready' || onchainState.status === 'partial'
     ? onchainState.deploymentTimestamp
-    : cachedCoverageIsComplete
-      ? cachedCoverage.deploymentTimestamp
-      : undefined
+    : undefined
   const monthOptions = useMemo(
     () => getAvailableAnalyticsMonths(displayRecords, deploymentTimestamp),
     [deploymentTimestamp, displayRecords],
@@ -1413,9 +1397,18 @@ export function AnalyticsScreen() {
     monthOptions,
     onMonthChange: setSelectedMonth,
   }
+  const analyticsHistory = useMemo(
+    () => history.filter((entry) => {
+      if (!entry.contractAddress) return true
+      return network?.analyticsContractAddresses.some((address) =>
+        address.toLowerCase() === entry.contractAddress?.toLowerCase(),
+      ) ?? false
+    }),
+    [history, network],
+  )
   const mergedHistory = useMemo(
-    () => mergeOnchainAndLocalHistory(displayRecords, history, networkName ?? 'Arc network'),
-    [displayRecords, history, networkName],
+    () => mergeOnchainAndLocalHistory(displayRecords, analyticsHistory, networkName ?? 'Arc network'),
+    [displayRecords, analyticsHistory, networkName],
   )
 
   const dateRange = useMemo<AnalyticsDateRange>(() => {
@@ -1471,30 +1464,22 @@ export function AnalyticsScreen() {
       ) : onchainState.status === 'loading' ? (
         <AnalyticsLoading
           progress={onchainState.progress}
+          contracts={onchainState.contracts}
           networkName={networkName}
           snapshot={onchainState.snapshot}
           cacheWarning={onchainState.cacheWarning}
           refresh={refresh}
-          dateRange={dateRange}
-          dateRangeError={dateRangeError}
-          chartMonthControls={chartMonthControls}
-          {...rangeControls}
         />
       ) : onchainState.status === 'error' ? (
         <AnalyticsError message={onchainState.message} retry={retry}>
           {onchainState.snapshot && (
-            <CachedAnalyticsSnapshot
-              snapshot={onchainState.snapshot}
+            <StaleCacheNotice
               updateFailed
-              dateRange={dateRange}
-              dateRangeError={dateRangeError}
-              chartMonthControls={chartMonthControls}
-              {...rangeControls}
             />
           )}
           <LocalOnlyHistory records={mergedHistory.localOnly} verificationComplete={false} />
         </AnalyticsError>
-      ) : onchainState.status !== 'ready' ? (
+      ) : onchainState.status !== 'ready' && onchainState.status !== 'partial' ? (
         <EmptyState
           icon={BarChart3}
           title="Connect a supported wallet"
@@ -1505,7 +1490,9 @@ export function AnalyticsScreen() {
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs" style={{ color: 'var(--muted)' }}>
               Verified through block {onchainState.scannedThroughBlock.toString()}
-              {` across ${network?.analyticsContractAddresses.length ?? 1} contract${(network?.analyticsContractAddresses.length ?? 1) === 1 ? '' : 's'}`}
+              {onchainState.status === 'partial'
+                ? ` across ${verifiedContractCount} of ${expectedContractCount} contracts`
+                : ` across ${expectedContractCount} contract${expectedContractCount === 1 ? '' : 's'}`}
             </p>
             <div className="flex flex-wrap gap-2">
               <button
@@ -1519,7 +1506,15 @@ export function AnalyticsScreen() {
               </button>
             </div>
           </div>
-          {onchainState.cacheWarning && (
+          {onchainState.status === 'partial' && (
+            <>
+              <p role="alert" className="rounded-xl p-3 text-xs" style={{ color: 'var(--warning)', background: 'var(--warning-surface)' }}>
+                Partial verified results: {onchainState.warning}
+              </p>
+              <ContractScanStatusList contracts={onchainState.contracts} />
+            </>
+          )}
+          {onchainState.status === 'ready' && onchainState.cacheWarning && (
             <p role="status" className="rounded-xl p-3 text-xs" style={{ color: 'var(--muted)', background: 'var(--surface-muted)' }}>
               {onchainState.cacheWarning}
             </p>

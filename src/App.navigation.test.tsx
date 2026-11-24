@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { useEffect, useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import type { Recipient } from '@/utils/arcsplit'
@@ -11,8 +12,28 @@ import {
   saveTemplate,
 } from '@/utils/splitStorage'
 
+const navigationLifecycle = vi.hoisted(() => ({
+  analyticsMounts: 0,
+  analyticsUnmounts: 0,
+  completeScan: undefined as (() => void) | undefined,
+}))
+
+const appState = vi.hoisted(() => ({
+  account: {
+    address: undefined as string | undefined,
+    chainId: undefined as number | undefined,
+    isConnected: false,
+  },
+  network: undefined as {
+    name: string
+    contractAddress: string
+    analyticsContractAddresses: string[]
+    explorerBase: string
+  } | undefined,
+}))
+
 vi.mock('wagmi', () => ({
-  useAccount: () => ({ chainId: undefined, isConnected: false }),
+  useAccount: () => appState.account,
 }))
 
 vi.mock('connectkit', () => ({
@@ -20,7 +41,7 @@ vi.mock('connectkit', () => ({
 }))
 
 vi.mock('@/utils/arcsplit', () => ({
-  getArcNetwork: () => undefined,
+  getArcNetwork: () => appState.network,
 }))
 
 vi.mock('@/utils/successSound', () => ({
@@ -116,13 +137,34 @@ vi.mock('@/components/MainnetDeploymentReview', () => ({
 }))
 
 vi.mock('@/components/LibraryScreens', () => ({
-  AnalyticsScreen: () => <div>Analytics interface</div>,
+  AnalyticsScreen: () => {
+    const [scanReady, setScanReady] = useState(false)
+    useEffect(() => {
+      navigationLifecycle.analyticsMounts += 1
+      navigationLifecycle.completeScan = () => setScanReady(true)
+      return () => {
+        navigationLifecycle.analyticsUnmounts += 1
+        navigationLifecycle.completeScan = undefined
+      }
+    }, [])
+    return (
+      <div>
+        <div>Analytics interface</div>
+        <div>{scanReady ? 'Verified analytics results' : 'Background analytics scan pending'}</div>
+      </div>
+    )
+  },
   SavedScreen: () => <div>Saved interface</div>,
   TemplatesScreen: () => <div>Templates interface</div>,
   HistoryScreen: () => <div>History interface</div>,
 }))
 
 beforeEach(() => {
+  navigationLifecycle.analyticsMounts = 0
+  navigationLifecycle.analyticsUnmounts = 0
+  navigationLifecycle.completeScan = undefined
+  appState.account = { address: undefined, chainId: undefined, isConnected: false }
+  appState.network = undefined
   const createStorage = () => {
     const values = new Map<string, string>()
     return {
@@ -151,12 +193,27 @@ function prepareDraft() {
   fireEvent.click(screen.getByRole('button', { name: 'Review draft' }))
 }
 
+function restoreMainnetWallet() {
+  appState.account = {
+    address: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    chainId: 5042,
+    isConnected: true,
+  }
+  appState.network = {
+    name: 'Arc Mainnet',
+    contractAddress: '0xF13199D9bbf965eE10f41b531Ee4aa660bB54738',
+    analyticsContractAddresses: ['0xF13199D9bbf965eE10f41b531Ee4aa660bB54738'],
+    explorerBase: 'https://explorer.arc.io',
+  }
+}
+
 describe('primary section navigation', () => {
   it('switches among five dedicated screens and marks the active section', () => {
     render(<App />)
     const navigation = screen.getByRole('navigation', { name: 'Primary navigation' })
 
     expect(screen.getByText('Send interface')).toBeTruthy()
+    expect(navigationLifecycle.analyticsMounts).toBe(0)
     expect(navigation.querySelector('[aria-current="page"]')?.textContent).toContain('Send')
 
     for (const [section, interfaceName] of [
@@ -178,6 +235,79 @@ describe('primary section navigation', () => {
     expect(screen.getByRole('main').classList.contains('max-w-4xl')).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'History' }))
     expect(screen.getByRole('main').classList.contains('max-w-4xl')).toBe(true)
+  })
+
+  it('renders Analytics while scanning and reuses it across tab navigation', () => {
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Analytics' }))
+    expect(screen.getByText('Analytics interface')).toBeTruthy()
+    expect(screen.getByText('Background analytics scan pending')).toBeTruthy()
+    expect(navigationLifecycle.analyticsMounts).toBe(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'History' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Analytics' }))
+
+    expect(navigationLifecycle.analyticsMounts).toBe(1)
+    expect(navigationLifecycle.analyticsUnmounts).toBe(0)
+  })
+
+  it('starts preload as soon as wallet restoration confirms a supported network', () => {
+    const view = render(<App />)
+    expect(navigationLifecycle.analyticsMounts).toBe(0)
+
+    restoreMainnetWallet()
+    view.rerender(<App />)
+
+    expect(screen.getByText('Send interface')).toBeTruthy()
+    expect(navigationLifecycle.analyticsMounts).toBe(1)
+    expect(navigationLifecycle.analyticsUnmounts).toBe(0)
+    expect(screen.getByRole('button', { name: 'Send' }).getAttribute('aria-current')).toBe('page')
+  })
+
+  it('does not preload Analytics for a connected unsupported network', () => {
+    appState.account = {
+      address: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      chainId: 1,
+      isConnected: true,
+    }
+
+    render(<App />)
+
+    expect(navigationLifecycle.analyticsMounts).toBe(0)
+  })
+
+  it('opens during preload without starting another scan', () => {
+    restoreMainnetWallet()
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Analytics' }))
+
+    expect(screen.getByText('Background analytics scan pending')).toBeTruthy()
+    expect(navigationLifecycle.analyticsMounts).toBe(1)
+  })
+
+  it('keeps an immediate Analytics click mounted when wallet restoration completes', () => {
+    const view = render(<App />)
+    fireEvent.click(screen.getByRole('button', { name: 'Analytics' }))
+    expect(navigationLifecycle.analyticsMounts).toBe(1)
+
+    restoreMainnetWallet()
+    view.rerender(<App />)
+
+    expect(screen.getByText('Background analytics scan pending')).toBeTruthy()
+    expect(navigationLifecycle.analyticsMounts).toBe(1)
+  })
+
+  it('uses verified preloaded results immediately when Analytics opens', () => {
+    restoreMainnetWallet()
+    render(<App />)
+
+    act(() => navigationLifecycle.completeScan?.())
+    fireEvent.click(screen.getByRole('button', { name: 'Analytics' }))
+
+    expect(screen.getByText('Verified analytics results')).toBeTruthy()
+    expect(navigationLifecycle.analyticsMounts).toBe(1)
   })
 
   it('starts a fresh Send flow after confirmed payment and preserves saved data and history', () => {

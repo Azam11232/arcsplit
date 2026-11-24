@@ -56,12 +56,22 @@ function ArcSplitApp() {
     ? network?.name ?? 'Unsupported network'
     : 'Wallet not connected'
   const [section, setSection] = useState<Section>('send')
+  const [hasVisitedAnalytics, setHasVisitedAnalytics] = useState(false)
+  const [hasPreparedAnalytics, setHasPreparedAnalytics] = useState(false)
   const [step, setStep] = useState<Step>(0)
   const [amountRaw, setAmountRaw] = useState<bigint>(0n)
   const [recipients, setRecipients] = useState<Recipient[]>(createInitialRecipients)
   const [sendFlowCompleted, setSendFlowCompleted] = useState(false)
   const [theme, setTheme] = useState<Theme>(getInitialTheme)
   const soundUnlockAttempted = useRef(false)
+  const hasSupportedWallet = isConnected
+    && !!address
+    && (network?.analyticsContractAddresses.length ?? 0) > 0
+  const shouldMountAnalytics = hasVisitedAnalytics || hasPreparedAnalytics || hasSupportedWallet
+
+  useEffect(() => {
+    if (hasSupportedWallet) setHasPreparedAnalytics(true)
+  }, [hasSupportedWallet])
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
@@ -113,6 +123,7 @@ function ArcSplitApp() {
     if (section === 'send' && nextSection !== 'send' && sendFlowCompleted) {
       resetSendFlow()
     }
+    if (nextSection === 'analytics') setHasVisitedAnalytics(true)
     setSection(nextSection)
   }, [section, sendFlowCompleted, resetSendFlow])
 
@@ -349,7 +360,11 @@ function ArcSplitApp() {
             />
           )}
           {section === 'history' && <HistoryScreen />}
-          {section === 'analytics' && <AnalyticsScreen />}
+          {shouldMountAnalytics && (
+            <div hidden={section !== 'analytics'}>
+              <AnalyticsScreen />
+            </div>
+          )}
         </div>
 
         {/* Footer */}
