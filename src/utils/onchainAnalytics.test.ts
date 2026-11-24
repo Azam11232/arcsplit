@@ -241,6 +241,37 @@ describe('on-chain ArcSplit analytics', () => {
     expect(calculateSplitAnalytics(result.records).weekly[0]?.totalRaw).toBe(1_500_000n)
   })
 
+  it('splits the exact request-limit error into complete inclusive ranges', async () => {
+    const rangeContract = '0x7878787878787878787878787878787878787878' as Address
+    const requests: Array<{ fromBlock: bigint; toBlock: bigint }> = []
+    const client = {
+      getBlockNumber: vi.fn(async () => 10n),
+      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
+      getBytecode: vi.fn(async () => '0x6000' as Hex),
+      getLogs: vi.fn(async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
+        requests.push({ fromBlock, toBlock })
+        if (fromBlock === 0n && toBlock === 10n) {
+          throw new Error('Request exceeds defined limit')
+        }
+        return []
+      }),
+    } as unknown as PublicClient
+
+    const result = await scanOnchainDistributions(client, {
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: rangeContract,
+      payer,
+    })
+
+    expect(requests).toEqual([
+      { fromBlock: 0n, toBlock: 10n },
+      { fromBlock: 0n, toBlock: 5n },
+      { fromBlock: 6n, toBlock: 10n },
+    ])
+    expect(result.coverage.scannedThroughBlock).toBe(10n)
+  })
+
   it('keeps separate distributions emitted in one transaction and aggregates each event once', async () => {
     const multiCallContract = '0x7777777777777777777777777777777777777777' as Address
     const sharedHash = `0x${'c'.repeat(64)}` as Hash
@@ -1008,9 +1039,13 @@ describe('on-chain ArcSplit analytics', () => {
       headers: new Headers({ 'Retry-After': '2' }),
       url: 'https://rpc.arc.invalid',
     })
-    const getLogs = vi.fn()
-      .mockRejectedValueOnce(rateLimitError)
-      .mockResolvedValueOnce([])
+    const requestStartedAt: number[] = []
+    const getLogs = vi.fn(() => {
+      requestStartedAt.push(Date.now())
+      return requestStartedAt.length === 1
+        ? Promise.reject(rateLimitError)
+        : Promise.resolve([])
+    })
     const client = {
       getBlockNumber: vi.fn(async () => 10n),
       getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
@@ -1018,27 +1053,49 @@ describe('on-chain ArcSplit analytics', () => {
       getLogs,
     } as unknown as PublicClient
 
-    vi.useFakeTimers()
-    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
-    try {
-      const scan = scanOnchainDistributions(client, {
-        chainId: 5042,
-        networkName: 'Arc Mainnet',
-        contractAddress: address,
-        payer,
-      })
+    const result = await scanOnchainDistributions(client, {
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: address,
+      payer,
+    })
 
-      await vi.advanceTimersByTimeAsync(0)
-      expect(getLogs).toHaveBeenCalledTimes(1)
-      await vi.advanceTimersByTimeAsync(1_999)
-      expect(getLogs).toHaveBeenCalledTimes(1)
-      await vi.advanceTimersByTimeAsync(1)
-      await expect(scan).resolves.toMatchObject({ coverage: { scannedThroughBlock: 10n } })
-      expect(getLogs).toHaveBeenCalledTimes(2)
-    } finally {
-      random.mockRestore()
-      vi.useRealTimers()
-    }
+    expect(result.coverage.scannedThroughBlock).toBe(10n)
+    expect(getLogs).toHaveBeenCalledTimes(2)
+    expect(requestStartedAt[1]! - requestStartedAt[0]!).toBeGreaterThanOrEqual(2_000)
+  })
+
+  it('treats the observed message with rate-limit details as a rate error, not a range error', async () => {
+    const address = '0x5959595959595959595959595959595959595959' as Address
+    const requests: Array<{ fromBlock: bigint; toBlock: bigint }> = []
+    const getLogs = vi.fn(({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) => {
+      requests.push({ fromBlock, toBlock })
+      return requests.length === 1
+        ? Promise.reject({
+          message: 'Request exceeds defined limit',
+          details: 'rate limit exceeded',
+        })
+        : Promise.resolve([])
+    })
+    const client = {
+      getBlockNumber: vi.fn(async () => 10n),
+      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
+      getBytecode: vi.fn(async () => '0x6000' as Hex),
+      getLogs,
+    } as unknown as PublicClient
+
+    const result = await scanOnchainDistributions(client, {
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: address,
+      payer,
+    })
+
+    expect(result.coverage.scannedThroughBlock).toBe(10n)
+    expect(requests).toEqual([
+      { fromBlock: 0n, toBlock: 10n },
+      { fromBlock: 0n, toBlock: 10n },
+    ])
   })
 
   it('applies jittered exponential backoff and stops after the bounded retry limit', async () => {
@@ -1048,12 +1105,9 @@ describe('on-chain ArcSplit analytics', () => {
       status: 429,
       url: 'https://rpc.arc.invalid',
     })
-    const getLogs = vi.fn(() => Promise.reject(rateLimitError))
+    const getBlockNumber = vi.fn(() => Promise.reject(rateLimitError))
     const client = {
-      getBlockNumber: vi.fn(async () => 10n),
-      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
-      getBytecode: vi.fn(async () => '0x6000' as Hex),
-      getLogs,
+      getBlockNumber,
     } as unknown as PublicClient
 
     vi.useFakeTimers()
@@ -1065,39 +1119,66 @@ describe('on-chain ArcSplit analytics', () => {
         contractAddress: address,
         payer,
       })
-      const failure = expect(scan).rejects.toThrow(/could not scan ArcSplit event logs/i)
+      const failure = expect(scan).rejects.toThrow(/HTTP request failed/i)
 
+      await vi.advanceTimersByTimeAsync(0)
+      expect(getBlockNumber).toHaveBeenCalledTimes(1)
       await vi.advanceTimersByTimeAsync(124)
-      expect(getLogs).toHaveBeenCalledTimes(1)
+      expect(getBlockNumber).toHaveBeenCalledTimes(1)
       await vi.advanceTimersByTimeAsync(1)
-      expect(getLogs).toHaveBeenCalledTimes(2)
+      expect(getBlockNumber).toHaveBeenCalledTimes(2)
       await vi.advanceTimersByTimeAsync(249)
-      expect(getLogs).toHaveBeenCalledTimes(2)
+      expect(getBlockNumber).toHaveBeenCalledTimes(2)
       await vi.advanceTimersByTimeAsync(1)
-      expect(getLogs).toHaveBeenCalledTimes(3)
+      expect(getBlockNumber).toHaveBeenCalledTimes(3)
       await vi.advanceTimersByTimeAsync(499)
-      expect(getLogs).toHaveBeenCalledTimes(3)
+      expect(getBlockNumber).toHaveBeenCalledTimes(3)
       await vi.advanceTimersByTimeAsync(1)
       await failure
-      expect(getLogs).toHaveBeenCalledTimes(4)
+      expect(getBlockNumber).toHaveBeenCalledTimes(4)
     } finally {
       random.mockRestore()
       vi.useRealTimers()
     }
   })
 
-  it('bounds concurrent RPC calls across independent Analytics scans', async () => {
+  it('retries textual rate-limit errors without an HTTP status', async () => {
+    const address = '0x5858585858585858585858585858585858585858' as Address
+    const getBlockNumber = vi.fn()
+      .mockRejectedValueOnce(new Error('rate limit exceeded'))
+      .mockResolvedValueOnce(10n)
+    const client = {
+      getBlockNumber,
+      getBlock: vi.fn(async () => ({ timestamp, hash: blockHash })),
+      getBytecode: vi.fn(async () => '0x6000' as Hex),
+      getLogs: vi.fn(async () => []),
+    } as unknown as PublicClient
+
+    const result = await scanOnchainDistributions(client, {
+      chainId: 5042,
+      networkName: 'Arc Mainnet',
+      contractAddress: address,
+      payer,
+    })
+
+    expect(result.coverage.scannedThroughBlock).toBe(10n)
+    expect(getBlockNumber).toHaveBeenCalledTimes(2)
+  })
+
+  it('serializes and paces concurrent contract log requests', async () => {
     const storage = createMemoryStorage()
     vi.stubGlobal('localStorage', storage)
-    const contractAddresses = Array.from({ length: 6 }, (_, index) =>
+    const contractAddresses = Array.from({ length: 3 }, (_, index) =>
       `0x${(index + 1).toString(16).padStart(40, '0')}` as Address,
     )
     let activeLogRequests = 0
     let maxActiveLogRequests = 0
+    const logRequestStarts: number[] = []
     const releaseLogRequests: Array<() => void> = []
     const getLogs = vi.fn(() => new Promise<never[]>((resolve) => {
       activeLogRequests += 1
       maxActiveLogRequests = Math.max(maxActiveLogRequests, activeLogRequests)
+      logRequestStarts.push(Date.now())
       releaseLogRequests.push(() => {
         activeLogRequests -= 1
         resolve([])
@@ -1120,20 +1201,23 @@ describe('on-chain ArcSplit analytics', () => {
         }),
       )
 
-      await vi.waitFor(() => expect(releaseLogRequests).toHaveLength(4))
-      expect(maxActiveLogRequests).toBe(4)
-      releaseLogRequests.splice(0).forEach((release) => release())
-
-      await vi.waitFor(() => expect(releaseLogRequests).toHaveLength(2))
-      releaseLogRequests.splice(0).forEach((release) => release())
+      for (let index = 0; index < contractAddresses.length; index += 1) {
+        await vi.waitFor(() => expect(releaseLogRequests).toHaveLength(1))
+        const release = releaseLogRequests.shift()
+        if (!release) throw new Error('Expected one throttled log request to be pending.')
+        release()
+      }
       await Promise.all(scans)
 
-      expect(getLogs).toHaveBeenCalledTimes(6)
-      expect(maxActiveLogRequests).toBe(4)
+      expect(getLogs).toHaveBeenCalledTimes(3)
+      expect(maxActiveLogRequests).toBe(1)
+      for (let index = 1; index < logRequestStarts.length; index += 1) {
+        expect(logRequestStarts[index]! - logRequestStarts[index - 1]!).toBeGreaterThanOrEqual(250)
+      }
     } finally {
       vi.unstubAllGlobals()
     }
-  })
+  }, 20_000)
 
   it('logs redacted RPC method, contract, range, duration, and failure diagnostics', async () => {
     const diagnosticContract = '0x7777777777777777777777777777777777777777' as Address

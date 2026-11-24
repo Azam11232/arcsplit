@@ -21,7 +21,8 @@ const recipientPayoutTopic = toEventSelector(recipientPayoutEvent)
 
 const LOG_BLOCK_RANGE = 10_000n
 const RECEIPT_CONCURRENCY = 4
-const RPC_MAX_CONCURRENT_REQUESTS = 4
+const RPC_MAX_CONCURRENT_REQUESTS = 1
+const RPC_MIN_LOG_REQUEST_INTERVAL_MS = 300
 const RPC_TIMEOUT_MS = 12_000
 const RPC_RETRY_BASE_DELAY_MS = 250
 const RPC_RETRY_MAX_DELAY_MS = 8_000
@@ -141,6 +142,8 @@ const deploymentBlocks = new Map<string, bigint>()
 const scanCaches = new Map<string, WalletScanCache>()
 let activeRpcRequests = 0
 const queuedRpcRequests: Array<() => void> = []
+let nextLogRequestAt = 0
+let rpcCooldownUntil = 0
 const scanJobs = new Map<string, {
   promise: Promise<OnchainScanResult>
   listeners: Set<(progress: OnchainScanProgress) => void>
@@ -400,6 +403,19 @@ async function withRpcRequestLimit<T>(request: () => Promise<T>): Promise<T> {
   }
 }
 
+async function waitForRpcRequestStart(method: string | undefined): Promise<void> {
+  const now = Date.now()
+  const isLogRequest = method === 'eth_getLogs'
+  const startAt = Math.max(
+    rpcCooldownUntil,
+    isLogRequest ? nextLogRequestAt : 0,
+  )
+  if (startAt > now) {
+    await new Promise((resolve) => setTimeout(resolve, startAt - now))
+  }
+  if (isLogRequest) nextLogRequestAt = Date.now() + RPC_MIN_LOG_REQUEST_INTERVAL_MS
+}
+
 function rpcErrorStatus(error: unknown): number | undefined {
   const visited = new Set<object>()
   let current = error
@@ -473,6 +489,8 @@ function isRangeLimitError(error: unknown): boolean {
   if (isRateLimitError(error)) return false
   const message = errorText(error).toLowerCase()
   return [
+    'request exceeds defined limit',
+    'exceeds the defined limit',
     'block range',
     'range limit',
     'range too large',
@@ -559,36 +577,48 @@ async function requestWithRetry<T>(
   request: () => Promise<T>,
   diagnostics?: RpcDiagnosticContext,
 ): Promise<T> {
-  let lastError: unknown
-  for (let attempt = 1; attempt <= RPC_MAX_ATTEMPTS; attempt += 1) {
-    let timeout: ReturnType<typeof setTimeout> | undefined
-    const startedAt = Date.now()
-    try {
-      const result = await withRpcRequestLimit(() => Promise.race([
-        request(),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(
-            () => reject(new Error(`${operation} timed out after ${RPC_TIMEOUT_MS / 1_000} seconds.`)),
-            RPC_TIMEOUT_MS,
-          )
-        }),
-      ]))
-      if (diagnostics) logRpcDiagnostic(diagnostics, attempt, Date.now() - startedAt)
-      return result
-    } catch (error) {
-      lastError = error
-      if (diagnostics) logRpcDiagnostic(diagnostics, attempt, Date.now() - startedAt, error, true)
-      if (attempt === RPC_MAX_ATTEMPTS || isRangeLimitError(error) || !isTransientRpcError(error)) {
-        throw error
+  return withRpcRequestLimit(async () => {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= RPC_MAX_ATTEMPTS; attempt += 1) {
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      await waitForRpcRequestStart(diagnostics?.method)
+      const startedAt = Date.now()
+      try {
+        const result = await Promise.race([
+          request(),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error(`${operation} timed out after ${RPC_TIMEOUT_MS / 1_000} seconds.`)),
+              RPC_TIMEOUT_MS,
+            )
+          }),
+        ])
+        if (diagnostics) logRpcDiagnostic(diagnostics, attempt, Date.now() - startedAt)
+        return result
+      } catch (error) {
+        lastError = error
+        if (diagnostics) logRpcDiagnostic(diagnostics, attempt, Date.now() - startedAt, error, true)
+        const rateLimited = isRateLimitError(error)
+        const retryDelay = retryDelayMilliseconds(error, attempt)
+        if (rateLimited) {
+          const retryAfter = retryAfterMilliseconds(error)
+          const cooldown = retryDelay ?? retryAfter ?? RPC_RETRY_BASE_DELAY_MS
+          rpcCooldownUntil = Math.max(rpcCooldownUntil, Date.now() + cooldown)
+        }
+        if (attempt === RPC_MAX_ATTEMPTS || isRangeLimitError(error) || !isTransientRpcError(error)) {
+          throw error
+        }
+        const delay = retryDelay ?? retryDelayMilliseconds(error, attempt)
+        if (delay === undefined) {
+          throw error
+        }
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout)
       }
-      const delay = retryDelayMilliseconds(error, attempt)
-      if (delay === undefined) throw error
-      await new Promise((resolve) => setTimeout(resolve, delay))
-    } finally {
-      if (timeout !== undefined) clearTimeout(timeout)
     }
-  }
-  throw lastError
+    throw lastError
+  })
 }
 
 export function createBlockRanges(
