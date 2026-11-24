@@ -322,10 +322,11 @@ describe('History screen', () => {
       },
     })
 
-    render(<AnalyticsScreen />)
+    const { container } = render(<AnalyticsScreen />)
 
     expect(screen.getByText('Stale cached snapshot · untrusted')).toBeTruthy()
     expect(screen.getByText(/Browser storage cannot authenticate cached analytics/)).toBeTruthy()
+    expect(container.querySelectorAll('.animate-pulse')).toHaveLength(4)
     expect(screen.queryByText('Total USDC distributed')).toBeNull()
     expect(screen.queryByText('9.00 USDC')).toBeNull()
     expect(screen.queryByRole('group', { name: /Daily Distributions/ })).toBeNull()
@@ -358,10 +359,123 @@ describe('History screen', () => {
     render(<AnalyticsScreen />)
 
     expect(screen.getByRole('heading', { name: 'Payment analytics' })).toBeTruthy()
+    expect(screen.getByText('Revalidating cached transactions')).toBeTruthy()
     expect(screen.getByText(/Revalidating cached receipts: 25 of 100/)).toBeTruthy()
+    expect(screen.getByRole('progressbar', { name: 'Receipts verified: 25 of 100' }).getAttribute('aria-valuenow')).toBe('25')
     expect(screen.queryByText('Scanning ArcSplit distribution events…')).toBeNull()
     expect(screen.queryByText('Total USDC distributed')).toBeNull()
-    expect(screen.getByText('Loading verified on-chain analytics')).toBeTruthy()
+    expect(screen.getByText('25%')).toBeTruthy()
+  })
+
+  it('shows receipt verification progress instead of completed block progress', () => {
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'verifying',
+          blocksScanned: 10_000n,
+          totalBlocks: 10_000n,
+          receiptsChecked: 25,
+          totalReceipts: 100,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+
+    const { rerender } = render(<AnalyticsScreen />)
+
+    expect(screen.getByText('Verifying on-chain transactions')).toBeTruthy()
+    expect(screen.getByText(/Verifying 25 of 100 transaction receipts/)).toBeTruthy()
+    expect(screen.getByRole('progressbar', { name: 'Receipts verified: 25 of 100' }).getAttribute('aria-valuenow')).toBe('25')
+    expect(screen.queryByText('100%')).toBeNull()
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
+
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'verifying',
+          blocksScanned: 10_000n,
+          totalBlocks: 10_000n,
+          receiptsChecked: 100,
+          totalReceipts: 100,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+    rerender(<AnalyticsScreen />)
+
+    expect(screen.getByText('Confirming on-chain checkpoint')).toBeTruthy()
+    expect(screen.getByText(/confirming canonical chain checkpoints/)).toBeTruthy()
+    expect(screen.queryByText('Total USDC distributed')).toBeNull()
+  })
+
+  it('shows block progress only while scanning and omits unavailable progress', () => {
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'scanning',
+          blocksScanned: 5_000n,
+          totalBlocks: 10_000n,
+          receiptsChecked: 0,
+          totalReceipts: 0,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+
+    const view = render(<AnalyticsScreen />)
+
+    expect(screen.getByText('Scanning on-chain activity')).toBeTruthy()
+    expect(screen.getByRole('progressbar', { name: 'Blocks scanned: 5000 of 10000' }).getAttribute('aria-valuenow')).toBe('50')
+
+    mocks.onchainAnalytics.mockReturnValue({
+      state: {
+        status: 'loading',
+        contextKey: 'mainnet-wallet',
+        contracts: [],
+        progress: {
+          phase: 'discovering',
+          blocksScanned: 0n,
+          totalBlocks: 0n,
+          receiptsChecked: 0,
+          totalReceipts: 0,
+        },
+      },
+      retry: vi.fn(),
+      refresh: vi.fn(),
+      network: {
+        name: 'Arc Mainnet',
+        analyticsContractAddresses: [activeMainnetContract],
+      },
+    })
+    view.rerender(<AnalyticsScreen />)
+
+    expect(screen.getByText('Preparing on-chain analytics')).toBeTruthy()
+    expect(screen.getByText(/Finding the contract deployment block/)).toBeTruthy()
+    expect(screen.queryByRole('progressbar')).toBeNull()
   })
 
   it('does not use unauthenticated cached records for financial totals', () => {

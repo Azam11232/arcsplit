@@ -89,13 +89,14 @@ USDC address: 0x3600000000000000000000000000000000000000
 Chain ID:     5042002
 ```
 
-After deploying, add the contract address to your `.env`:
+To point the app at a deployed Arc Testnet contract, set the optional Testnet override in `.env`:
 
 ```
-VITE_ARCSPLIT_ADDRESS=0x<your deployed address>
+VITE_ARCSPLIT_TESTNET_ADDRESS=0x<your deployed address>
 ```
 
-Then restart the dev server (`bun run dev`) so Vite picks up the new env variable.
+If unset, the app uses the Testnet address configured in `src/utils/arcsplit.ts`.
+Restart the dev server (`bun run dev`) after changing this value.
 
 ---
 
@@ -192,7 +193,10 @@ This contract is live on Arc Testnet and can be used immediately with testnet US
 | Deployed | 2026-10-19 |
 | Constructor arg | USDC `0x3600000000000000000000000000000000000000` |
 
-The `.env.example` file in this repo has `VITE_ARCSPLIT_ADDRESS` pre-filled with the address above. Copy it to `.env` and run `bun run dev` to use the live contract immediately.
+The optional Testnet override is documented in `.env.example`; it is not pre-filled
+with the deployment record above. Set `VITE_ARCSPLIT_TESTNET_ADDRESS` to that
+address if you want the app to target it. Mainnet contract selection is defined
+in `src/utils/arcsplit.ts` and is not controlled by an environment variable.
 
 To get testnet USDC, use the **Get test USDC** button in Arc Studio's sidebar, or ask on the Arc Discord.
 

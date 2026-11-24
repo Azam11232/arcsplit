@@ -1071,16 +1071,38 @@ function AnalyticsLoading({
   cacheWarning?: string
   refresh: () => void
 }) {
-  const percentage = progress.totalBlocks > 0n
+  const isScanningBlocks = progress.phase === 'scanning' && progress.totalBlocks > 0n
+  const isVerifyingReceipts = (
+    progress.phase === 'revalidating' || progress.phase === 'verifying'
+  ) && progress.totalReceipts > 0
+  const percentage = isScanningBlocks
     ? Math.min(100, Number((progress.blocksScanned * 100n) / progress.totalBlocks))
-    : undefined
+    : isVerifyingReceipts
+      ? Math.min(100, Math.floor((progress.receiptsChecked * 100) / progress.totalReceipts))
+      : undefined
+  const progressDescription = isScanningBlocks
+    ? `Blocks scanned: ${progress.blocksScanned.toString()} of ${progress.totalBlocks.toString()}`
+    : isVerifyingReceipts
+      ? `Receipts verified: ${progress.receiptsChecked} of ${progress.totalReceipts}`
+      : undefined
+  const phaseTitle = progress.phase === 'discovering'
+    ? 'Preparing on-chain analytics'
+    : progress.phase === 'revalidating'
+      ? 'Revalidating cached transactions'
+      : progress.phase === 'scanning'
+        ? 'Scanning on-chain activity'
+        : progress.totalReceipts > 0 && progress.receiptsChecked < progress.totalReceipts
+          ? 'Verifying on-chain transactions'
+          : 'Confirming on-chain checkpoint'
   const phaseLabel = progress.phase === 'discovering'
     ? 'Finding the contract deployment block…'
     : progress.phase === 'revalidating'
       ? `Revalidating cached receipts: ${progress.receiptsChecked} of ${progress.totalReceipts}…`
       : progress.phase === 'scanning'
         ? 'Scanning ArcSplit distribution events…'
-        : `Verifying ${progress.receiptsChecked} of ${progress.totalReceipts} transaction receipts…`
+        : progress.totalReceipts > 0 && progress.receiptsChecked < progress.totalReceipts
+          ? `Verifying ${progress.receiptsChecked} of ${progress.totalReceipts} transaction receipts…`
+          : 'Receipts verified; confirming canonical chain checkpoints…'
 
   return (
     <div className="space-y-4">
@@ -1088,14 +1110,30 @@ function AnalyticsLoading({
         <div className="flex items-start gap-3">
           <LoaderCircle className="mt-0.5 h-5 w-5 flex-shrink-0 animate-spin" style={{ color: 'var(--accent-hover)' }} aria-hidden="true" />
           <div className="min-w-0 flex-1">
-            <p className="text-sm font-semibold" style={{ color: 'var(--ink)' }}>Loading verified on-chain analytics</p>
+            <p className="text-sm font-semibold" style={{ color: 'var(--ink)' }}>{phaseTitle}</p>
             <p className="mt-1 text-xs" style={{ color: 'var(--muted)' }}>{phaseLabel}{networkName ? ` · ${networkName}` : ''}</p>
             {percentage !== undefined && (
               <div className="mt-3">
-                <div className="h-1.5 overflow-hidden rounded-full" style={{ background: 'var(--border)' }}>
-                  <div className="h-full rounded-full transition-[width] duration-300" style={{ width: `${percentage}%`, background: 'var(--accent-gradient)' }} />
+                <div
+                  role="progressbar"
+                  aria-label={progressDescription}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={percentage}
+                  aria-valuetext={`${progressDescription} (${percentage}%)`}
+                  className="h-1.5 overflow-hidden rounded-full"
+                  style={{ background: 'var(--border)' }}
+                >
+                  <div
+                    className="h-full rounded-full transition-[width] duration-300 motion-reduce:transition-none"
+                    style={{ width: `${percentage}%`, background: 'var(--accent-gradient)' }}
+                    aria-hidden="true"
+                  />
                 </div>
-                <p className="mt-1.5 text-right text-[10px] tabular-nums" style={{ color: 'var(--muted)' }}>{percentage}%</p>
+                <p className="mt-1.5 flex flex-wrap justify-between gap-x-3 text-[10px] tabular-nums" style={{ color: 'var(--muted)' }}>
+                  <span>{progressDescription}</span>
+                  <span>{percentage}%</span>
+                </p>
               </div>
             )}
           </div>
@@ -1123,18 +1161,14 @@ function AnalyticsLoading({
           {cacheWarning}
         </p>
       )}
-      {!snapshot && (
-        <>
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3" aria-hidden="true">
-            {[1, 2, 3].map((item) => (
-              <div key={item} className="h-32 animate-pulse rounded-2xl" style={{ background: 'var(--surface-muted)', border: '1px solid var(--border)' }} />
-            ))}
-          </div>
-          <div className="grid gap-4" aria-hidden="true">
-            <div className="h-64 animate-pulse rounded-2xl" style={{ background: 'var(--surface-muted)', border: '1px solid var(--border)' }} />
-          </div>
-        </>
-      )}
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3" aria-hidden="true">
+        {[1, 2, 3].map((item) => (
+          <div key={item} className="h-32 animate-pulse rounded-2xl" style={{ background: 'var(--surface-muted)', border: '1px solid var(--border)' }} />
+        ))}
+      </div>
+      <div className="grid gap-4" aria-hidden="true">
+        <div className="h-64 animate-pulse rounded-2xl" style={{ background: 'var(--surface-muted)', border: '1px solid var(--border)' }} />
+      </div>
     </div>
   )
 }
